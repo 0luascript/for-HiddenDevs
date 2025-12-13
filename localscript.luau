@@ -1,3 +1,6 @@
+-- Astral projection for HD APPROVE ME PLEASE
+-- Press R to leave your body and fly a ghost out of body camera
+
 local players = game:GetService("Players")
 local runService = game:GetService("RunService")
 local userInputService = game:GetService("UserInputService")
@@ -9,11 +12,13 @@ local camera = workspace.CurrentCamera
 
 local astralKey = Enum.KeyCode.R
 
+-- basic astral state
 local astralActive = false
 local astralPos
 local astralStartTime = 0
 local maxAstralTime = 12
 
+-- ghost rig + tether
 local ghostModel
 local ghostRootPart
 local ghostParts = {}
@@ -21,6 +26,7 @@ local bodyAttachment
 local ghostAttachment
 local tetherBeam
 
+-- character state backup
 local humanoid
 local rootPart
 local savedWalkSpeed
@@ -31,12 +37,14 @@ local savedRootAnchored
 local animateScript
 local savedAnimateDisabled
 
+-- camera state backup
 local originalCameraType
 local originalCameraSubject
 local originalMouseBehavior
 local originalMouseIcon
 local originalFov
 
+-- keyboard input for ghost movement
 local keyDown = {
 	w = false,
 	a = false,
@@ -46,13 +54,16 @@ local keyDown = {
 	shift = false
 }
 
+-- ghost look direction
 local yaw = 0
 local pitch = 0
 
+-- connections to cleanly disconnect on exit
 local renderConn
 local mouseConn
 local charRemovingConn
 
+-- small glass burst when you leave the body
 local function spawnShards(position)
 	for i = 1, 18 do
 		local p = Instance.new("Part")
@@ -88,6 +99,7 @@ local function spawnShards(position)
 	end
 end
 
+
 local function destroyGhost()
 	if ghostModel then
 		for _, info in ipairs(ghostParts) do
@@ -122,6 +134,7 @@ local function destroyGhost()
 	tetherBeam = nil
 end
 
+-- clone the character into a static "ghost" rig
 local function buildGhost()
 	local character = player.Character
 	if not character then return end
@@ -161,6 +174,7 @@ local function buildGhost()
 		end
 	end
 
+	-- fallback ghost root if it goes left
 	if not ghostRootPart then
 		ghostRootPart = Instance.new("Part")
 		ghostRootPart.Size = Vector3.new(2, 2, 2)
@@ -179,6 +193,7 @@ local function buildGhost()
 		})
 	end
 
+	-- tether between body and ghost
 	bodyAttachment = Instance.new("Attachment")
 	bodyAttachment.Name = "AstralBodyAttachment"
 	bodyAttachment.Parent = rootPart
@@ -202,6 +217,7 @@ local function buildGhost()
 	tetherBeam.CurveSize1 = -3
 	tetherBeam.Parent = ghostModel
 
+	-- start ghost  above the body
 	astralPos = rootPart.Position + rootPart.CFrame.LookVector * 7 + Vector3.new(0, 3, 0)
 
 	local _, ry = rootPart.CFrame:ToEulerAnglesYXZ()
@@ -209,6 +225,7 @@ local function buildGhost()
 	pitch = 0
 end
 
+-- keep ghost rig posed relative to its own root
 local function updateGhostCFrames(baseCFrame)
 	for _, info in ipairs(ghostParts) do
 		if info.ghost and info.ghost.Parent then
@@ -217,6 +234,7 @@ local function updateGhostCFrames(baseCFrame)
 	end
 end
 
+-- freeze or unfreeze the real character while in ghost mode
 local function setCharacterFrozen(state)
 	local character = player.Character
 	if not character then return end
@@ -225,11 +243,13 @@ local function setCharacterFrozen(state)
 	if not humanoid or not rootPart then return end
 
 	if state then
+		-- save original movement values
 		savedWalkSpeed = humanoid.WalkSpeed
 		savedJumpPower = humanoid.JumpPower
 		savedAutoRotate = humanoid.AutoRotate
 		savedPlatformStand = humanoid.PlatformStand
 
+		-- lock body in place
 		humanoid.WalkSpeed = 0
 		humanoid.JumpPower = 0
 		humanoid.AutoRotate = false
@@ -249,6 +269,7 @@ local function setCharacterFrozen(state)
 			animateScript.Disabled = true
 		end
 	else
+		-- restore character movement
 		if humanoid and humanoid.Parent then
 			if savedWalkSpeed then humanoid.WalkSpeed = savedWalkSpeed end
 			if savedJumpPower then humanoid.JumpPower = savedJumpPower end
@@ -277,6 +298,7 @@ local function setCharacterFrozen(state)
 			end
 		end
 
+		-- clear cached values
 		savedWalkSpeed = nil
 		savedJumpPower = nil
 		savedAutoRotate = nil
@@ -287,6 +309,7 @@ local function setCharacterFrozen(state)
 	end
 end
 
+-- fully exit astral mode and restore everything back to normal
 local function stopAstral()
 	if not astralActive then return end
 	astralActive = false
@@ -331,6 +354,7 @@ local function stopAstral()
 	keyDown.shift = false
 end
 
+-- toggle astral mode on to off
 local function startAstral()
 	if astralActive then
 		stopAstral()
@@ -348,12 +372,14 @@ local function startAstral()
 	astralActive = true
 	astralStartTime = tick()
 
+	-- store camera and mouse settings
 	originalCameraType = camera.CameraType
 	originalCameraSubject = camera.CameraSubject
 	originalMouseBehavior = userInputService.MouseBehavior
 	originalMouseIcon = userInputService.MouseIconEnabled
 	originalFov = camera.FieldOfView
 
+	-- switch to scriptable camera for free flight
 	camera.CameraType = Enum.CameraType.Scriptable
 	camera.CameraSubject = nil
 	userInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
@@ -363,6 +389,7 @@ local function startAstral()
 	buildGhost()
 	spawnShards(rootPart.Position)
 
+	-- mouse look for ghost
 	mouseConn = userInputService.InputChanged:Connect(function(input, gpe)
 		if not astralActive then return end
 		if input.UserInputType == Enum.UserInputType.MouseMovement then
@@ -372,6 +399,7 @@ local function startAstral()
 		end
 	end)
 
+	-- per frame update while in astral mode
 	renderConn = runService.RenderStepped:Connect(function(dt)
 		if not astralActive then return end
 		if not ghostRootPart or not ghostRootPart.Parent then
@@ -379,6 +407,7 @@ local function startAstral()
 			return
 		end
 
+		-- simple duration limit so it doesn't run forever
 		if tick() - astralStartTime > maxAstralTime then
 			stopAstral()
 			return
@@ -403,6 +432,7 @@ local function startAstral()
 			astralPos += finalMove * speed * dt
 		end
 
+		-- ghost orientation and camera orbit
 		local baseCf = CFrame.new(astralPos) * CFrame.Angles(0, yaw, 0)
 		local camOffset = CFrame.Angles(pitch, 0, 0) * CFrame.new(0, 2.5, 9)
 		local targetCamCf = baseCf * camOffset
@@ -416,11 +446,13 @@ local function startAstral()
 		updateGhostCFrames(baseCf)
 	end)
 
+	-- for safety: so if the character respawns mid-astral, shut it off
 	charRemovingConn = player.CharacterRemoving:Connect(function()
 		stopAstral()
 	end)
 end
 
+-- keyboard input for toggling  and movement flags
 userInputService.InputBegan:Connect(function(input, gpe)
 	if gpe then return end
 	if input.UserInputType == Enum.UserInputType.Keyboard then
