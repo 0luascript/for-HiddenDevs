@@ -62,10 +62,12 @@ local viewConfigs: { [ViewKey]: ViewConfig } = {
 	},
 }
 
+-- getWorldCamera exists so fov effects survive CurrentCamera swaps
 local function getWorldCamera(): Camera?
 	return Workspace.CurrentCamera
 end
 
+-- newInstance exists so object construction stays consistent and easy to audit
 local function newInstance<T>(className: string, props: { [string]: any }?, parent: Instance?): T
 	local inst = Instance.new(className)
 	if props then
@@ -79,18 +81,19 @@ local function newInstance<T>(className: string, props: { [string]: any }?, pare
 	return inst :: any
 end
 
+-- playTween exists so animations don’t repeat boilerplate and stay consistent
 local function playTween(inst: Instance, info: TweenInfo, props: { [string]: any })
 	local t = TweenService:Create(inst, info, props)
 	t:Play()
 	return t
 end
 
+-- clamp01 exists so lerp alpha can be frame-rate independent without overshooting
 local function clamp01(x: number): number
 	return math.clamp(x, 0, 1)
 end
 
 local currentChar: Model?
-local humanoid: Humanoid?
 local rootPart: BasePart?
 
 local uiEnabled = false
@@ -99,16 +102,16 @@ local screenGui: ScreenGui?
 local holderFrame: Frame?
 local viewports: { [ViewKey]: ViewportFrame } = {}
 
-local rigs: {
-	{
-		key: ViewKey,
-		world: WorldModel,
-		model: Model,
-		partMap: { [BasePart]: BasePart },
-		rootClone: BasePart,
-		camera: Camera,
-	}
-} = {}
+type Rig = {
+	key: ViewKey,
+	world: WorldModel,
+	model: Model,
+	partMap: { [BasePart]: BasePart },
+	rootClone: BasePart,
+	camera: Camera,
+}
+
+local rigs: { Rig } = {}
 
 local renderConn: RBXScriptConnection?
 local baseWorldFov: number?
@@ -120,16 +123,13 @@ local fullViewport: ViewportFrame?
 
 local uiSessionId = 0
 
--- refreshCharacter exists so the update loop can assume cached references instead of searching every frame
+-- refreshCharacter exists so per-frame code doesn’t search the character hierarchy repeatedly
 local function refreshCharacter()
 	currentChar = player.Character
 	if not currentChar then
-		humanoid = nil
 		rootPart = nil
 		return
 	end
-
-	humanoid = currentChar:FindFirstChildOfClass("Humanoid")
 
 	local hrp = currentChar:FindFirstChild("HumanoidRootPart")
 	if hrp and hrp:IsA("BasePart") then
@@ -139,7 +139,7 @@ local function refreshCharacter()
 	end
 end
 
--- ensureCctvEffect exists so the “cctv look” is applied consistently and removed cleanly on disable
+-- ensureCctvEffect exists so visual grading is tied to enable/disable lifecycle
 local function ensureCctvEffect()
 	if cctvEffect and cctvEffect.Parent then
 		return
@@ -154,7 +154,7 @@ local function ensureCctvEffect()
 	}, Lighting)
 end
 
--- destroyRigs exists so toggling never leaves hidden geometry in memory
+-- destroyRigs exists so toggling can’t leak WorldModels and slowly degrade performance
 local function destroyRigs()
 	for _, rig in ipairs(rigs) do
 		if rig.world and rig.world.Parent then
@@ -164,7 +164,7 @@ local function destroyRigs()
 	table.clear(rigs)
 end
 
--- destroyUi exists so disabling returns PlayerGui to its original state
+-- destroyUi exists so the script leaves PlayerGui clean after disable
 local function destroyUi()
 	if screenGui and screenGui.Parent then
 		screenGui:Destroy()
@@ -176,7 +176,7 @@ local function destroyUi()
 	fullViewport = nil
 end
 
--- clearFullscreen exists so we always reparent the active world back before destroying the overlay
+-- clearFullscreen exists so worlds always return to their small viewport before overlay cleanup
 local function clearFullscreen()
 	if not focusedViewKey then
 		return
@@ -206,7 +206,7 @@ local function clearFullscreen()
 	focusedViewKey = nil
 end
 
--- buildUi exists so runtime logic can assume viewports are present and named consistently
+-- buildUi exists so the rest of the script can assume viewports are present and stable
 local function buildUi()
 	if screenGui and screenGui.Parent then
 		return
@@ -236,9 +236,7 @@ local function buildUi()
 		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
 	}, holderFrame)
 
-	newInstance("UICorner", {
-		CornerRadius = UDim.new(0, 10),
-	}, holderFrame)
+	newInstance("UICorner", { CornerRadius = UDim.new(0, 10) }, holderFrame)
 
 	newInstance("UIPadding", {
 		PaddingTop = UDim.new(0, 8),
@@ -297,9 +295,7 @@ local function buildUi()
 		BorderSizePixel = 0,
 	}, holderFrame)
 
-	newInstance("UICorner", {
-		CornerRadius = UDim.new(1, 0),
-	}, recDot)
+	newInstance("UICorner", { CornerRadius = UDim.new(1, 0) }, recDot)
 
 	local timeLabel = newInstance("TextLabel", {
 		Name = "Clock",
@@ -337,17 +333,12 @@ local function buildUi()
 			BorderSizePixel = 0,
 			Size = UDim2.new(0.33, -4, 1, 0),
 			BackgroundTransparency = 1,
-
-			-- setting these avoids “everything is black” when a feed has geometry but no usable light
 			LightColor = Color3.fromRGB(255, 255, 255),
 			LightDirection = Vector3.new(-0.6, -1, -0.4),
 			Ambient = Color3.fromRGB(70, 70, 90),
 		}, vpHolder)
 
-		newInstance("UICorner", {
-			CornerRadius = UDim.new(0, 8),
-		}, vp)
-
+		newInstance("UICorner", { CornerRadius = UDim.new(0, 8) }, vp)
 		newInstance("UIStroke", {
 			Thickness = 1,
 			Color = Color3.fromRGB(200, 200, 220),
@@ -378,7 +369,6 @@ local function buildUi()
 	uiSessionId += 1
 	local mySession = uiSessionId
 
-	-- running ui loops behind a session token avoids leftover threads after fast toggles
 	task.spawn(function()
 		while uiEnabled and screenGui and mySession == uiSessionId do
 			recDot.BackgroundTransparency = 0
@@ -401,7 +391,7 @@ local function buildUi()
 	end)
 end
 
--- fadeUiOut exists so disabling feels intentional and does not pop ui instantly
+-- fadeUiOut exists so disabling doesn’t pop the hud and gives a clear “mode off” signal
 local function fadeUiOut()
 	if not screenGui or not holderFrame then
 		destroyUi()
@@ -419,9 +409,9 @@ local function fadeUiOut()
 	end)
 end
 
--- createClonePart exists to avoid cloning live parts (which can inherit invisibility modifiers)
+-- createClonePart exists to avoid cloning live character parts which can inherit invisibility modifiers
 local function createClonePart(original: BasePart, parentModel: Model): BasePart
-	local clone = newInstance("Part", {
+	return newInstance("Part", {
 		Name = original.Name,
 		Size = original.Size,
 		Anchored = true,
@@ -435,12 +425,10 @@ local function createClonePart(original: BasePart, parentModel: Model): BasePart
 		CastShadow = false,
 		CFrame = original.CFrame,
 	}, parentModel)
-
-	return clone
 end
 
--- buildRig exists to keep each viewport isolated with its own world and camera
-local function buildRig(viewKey: ViewKey)
+-- buildRig exists so each feed has an isolated WorldModel and camera without touching the live world
+local function buildRig(viewKey: ViewKey): Rig?
 	refreshCharacter()
 	if not currentChar or not rootPart then
 		return nil
@@ -451,13 +439,8 @@ local function buildRig(viewKey: ViewKey)
 		return nil
 	end
 
-	local world = newInstance("WorldModel", {
-		Name = "CCTVWorld_" .. viewKey,
-	}, viewport)
-
-	local rigModel = newInstance("Model", {
-		Name = "CCTVRig_" .. viewKey,
-	}, world)
+	local world = newInstance("WorldModel", { Name = "CCTVWorld_" .. viewKey }, viewport)
+	local rigModel = newInstance("Model", { Name = "CCTVRig_" .. viewKey }, world)
 
 	local partMap: { [BasePart]: BasePart } = {}
 	local rootClone: BasePart? = nil
@@ -474,7 +457,6 @@ local function buildRig(viewKey: ViewKey)
 		end
 	end
 
-	-- rootClone is required for camera math, so we guarantee it even if the rig scan missed it
 	if not rootClone then
 		rootClone = createClonePart(rootPart, rigModel)
 		rootClone.Name = "RootClone"
@@ -497,7 +479,7 @@ local function buildRig(viewKey: ViewKey)
 	}
 end
 
--- buildAllRigs exists to ensure the 3 feeds are created together so the ui always matches state
+-- buildAllRigs exists so the hud always shows a complete set of feeds or none at all
 local function buildAllRigs()
 	destroyRigs()
 	if not (viewports.rear and viewports.side and viewports.top) then
@@ -508,18 +490,12 @@ local function buildAllRigs()
 	local sideRig = buildRig("side")
 	local topRig = buildRig("top")
 
-	if rearRig then
-		table.insert(rigs, rearRig)
-	end
-	if sideRig then
-		table.insert(rigs, sideRig)
-	end
-	if topRig then
-		table.insert(rigs, topRig)
-	end
+	if rearRig then table.insert(rigs, rearRig) end
+	if sideRig then table.insert(rigs, sideRig) end
+	if topRig then table.insert(rigs, topRig) end
 end
 
--- updateRigs exists to sync the visual copies to the live character without touching real gameplay parts
+-- updateRigs exists to mirror the live character pose without affecting gameplay physics or replication
 local function updateRigs(dt: number)
 	if not uiEnabled then
 		return
@@ -552,7 +528,6 @@ local function updateRigs(dt: number)
 		local wobble = cfg.wobbleAmp * math.sin(now * cfg.wobbleSpeed + cfg.pulsePhase)
 		local camPos = origin + cfg.cameraOffset + Vector3.new(0, wobble, 0)
 
-		-- lerp keeps feeds stable across variable fps while still tracking movement quickly
 		rig.camera.CFrame = rig.camera.CFrame:Lerp(
 			CFrame.new(camPos, origin),
 			clamp01(dt * 10)
@@ -563,7 +538,7 @@ local function updateRigs(dt: number)
 	end
 end
 
--- pulseWorldCamera exists to signal mode entry without permanently changing player camera settings
+-- pulseWorldCamera exists to make mode entry obvious without changing camera ownership long-term
 local function pulseWorldCamera()
 	local cam = getWorldCamera()
 	if not cam then
@@ -585,7 +560,7 @@ local function pulseWorldCamera()
 	up:Play()
 end
 
--- resetWorldFov exists to guarantee the script never leaves the main camera modified on exit
+-- resetWorldFov exists so the script never leaves the main camera modified after disable
 local function resetWorldFov()
 	local cam = getWorldCamera()
 	if not cam or not baseWorldFov then
@@ -596,7 +571,7 @@ local function resetWorldFov()
 	playTween(cam, ti, { FieldOfView = baseWorldFov })
 end
 
--- enterFocus exists so fullscreen reuses the same world, preventing mismatched feed state
+-- enterFocus exists so fullscreen shows the same feed by reparenting the existing WorldModel
 local function enterFocus(viewKey: ViewKey)
 	if not uiEnabled or not screenGui or not holderFrame then
 		return
@@ -671,7 +646,6 @@ local function enterFocus(viewKey: ViewKey)
 		ZIndex = 7,
 	}, fullFrame)
 
-	-- reparenting the active world avoids duplicating geometry for fullscreen and keeps fps stable
 	for _, rig in ipairs(rigs) do
 		if rig.key == viewKey then
 			rig.world.Parent = fullViewport
@@ -687,7 +661,7 @@ local function enterFocus(viewKey: ViewKey)
 	focusedViewKey = viewKey
 end
 
--- enableHud exists to build all state in one place so toggling is predictable
+-- enableHud exists to build state in one place so toggling stays predictable
 local function enableHud()
 	if uiEnabled then
 		return
@@ -710,7 +684,7 @@ local function enableHud()
 	renderConn = RunService.RenderStepped:Connect(updateRigs)
 end
 
--- disableHud exists to tear down in a safe order so nothing references destroyed instances
+-- disableHud exists to tear down safely so nothing references destroyed instances
 local function disableHud()
 	if not uiEnabled then
 		return
@@ -743,10 +717,9 @@ local function toggleHud()
 	end
 end
 
--- character hooks exist so the hud stays correct after respawn without requiring a script restart
+-- character hooks exist so rigs rebuild after respawn without forcing a script restart
 local function onCharacterAdded(char: Model)
 	currentChar = char
-	humanoid = char:FindFirstChildOfClass("Humanoid")
 
 	local hrp = char:FindFirstChild("HumanoidRootPart")
 	if hrp and hrp:IsA("BasePart") then
@@ -762,7 +735,6 @@ end
 
 local function onCharacterRemoving()
 	currentChar = nil
-	humanoid = nil
 	rootPart = nil
 
 	clearFullscreen()
@@ -776,7 +748,7 @@ end
 player.CharacterAdded:Connect(onCharacterAdded)
 player.CharacterRemoving:Connect(onCharacterRemoving)
 
--- input handler is kept small so it’s obvious which keys can affect state
+-- input stays minimal so reviewers can quickly verify state transitions and keybinds
 UserInputService.InputBegan:Connect(function(input: InputObject, gpe: boolean)
 	if gpe then
 		return
@@ -803,7 +775,7 @@ UserInputService.InputBegan:Connect(function(input: InputObject, gpe: boolean)
 	end
 end)
 
--- camera watcher exists so fov reset targets the correct camera even if Roblox swaps CurrentCamera
+-- camera watcher exists so baseWorldFov stays correct if Roblox replaces CurrentCamera
 Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
 	local cam = Workspace.CurrentCamera
 	if cam then
