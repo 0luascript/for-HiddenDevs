@@ -1,784 +1,400 @@
+--// services (cached once so we don't keep calling GetService)
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local Workspace = game:GetService("Workspace")
-local Lighting = game:GetService("Lighting")
+
+--// modules
+-- Config = keybinds + per-view labels/hints
+-- Utils = tweens/helpers + disconnect safety
+-- Effects = postfx + fov pulse
+-- CameraRig = builds the viewport "world" + keeps it in sync
+local Config = require(script.Parent.Config)
+local Utils = require(script.Parent.Utils)
+local Effects = require(script.Parent.Effects)
+local CameraRig = require(script.Parent.CameraRig)
+
+local Controller = {}
 
 local player = Players.LocalPlayer
-local toggleKey = Enum.KeyCode.P
+local playerGui = player:WaitForChild("PlayerGui")
 
-type ViewKey = "rear" | "side" | "top"
+-- core state
+-- enabled is the big kill-switch (render loop + input logic checks it)
+-- sessionId is basically my "cancel token" for task.spawn loops so they don't keep running after disable
+-- focusedView tells me which rig is currently living in the fullscreen viewport
+local enabled = false
+local character = nil
+local rootPart = nil
+local rigs = {}
+local renderConn = nil
+local sessionId = 0
+local focusedView = nil
 
-type ViewConfig = {
-	fullLabel: string,
-	hintKey: string,
-	originOffset: Vector3,
-	cameraOffset: Vector3,
-	baseFov: number,
-	wobbleAmp: number,
-	wobbleSpeed: number,
-	pulseAmp: number,
-	pulseSpeed: number,
-	pulsePhase: number,
-}
+-- ui refs (filled in init; I don't wanna be doing WaitForChild/FindFirstChild in RenderStepped)
+local screenGui
+local holder
+local header
+local vpContainer
+local fullOverlay
+local viewports = {}
+local fullViewport
+local fullCamLabel
+local fullHint
 
-local viewConfigs: { [ViewKey]: ViewConfig } = {
-	rear = {
-		fullLabel = "CAM 01 // REAR VIEW",
-		hintKey = "1",
-		originOffset = Vector3.new(0, 2, 0),
-		cameraOffset = Vector3.new(0, 2.3, 4.6),
-		baseFov = 47,
-		wobbleAmp = 0.05,
-		wobbleSpeed = 1.8,
-		pulseAmp = 1.0,
-		pulseSpeed = 2.8,
-		pulsePhase = 0.0,
-	},
-	side = {
-		fullLabel = "CAM 02 // PROFILE VIEW",
-		hintKey = "2",
-		originOffset = Vector3.new(0, 1.6, 0),
-		cameraOffset = Vector3.new(5.2, 1.8, 0),
-		baseFov = 52,
-		wobbleAmp = 0.04,
-		wobbleSpeed = 1.8,
-		pulseAmp = 1.0,
-		pulseSpeed = 2.8,
-		pulsePhase = 1.0,
-	},
-	top = {
-		fullLabel = "CAM 03 // OVERHEAD",
-		hintKey = "3",
-		originOffset = Vector3.new(0, 2.2, 0),
-		cameraOffset = Vector3.new(0, 6, 0.001),
-		baseFov = 40,
-		wobbleAmp = 0.12,
-		wobbleSpeed = 1.8,
-		pulseAmp = 1.0,
-		pulseSpeed = 2.8,
-		pulsePhase = 2.0,
-	},
-}
+-- fadeIn resets transparency first
+-- this matters because you can toggle on while the old fadeOut is mid-tween (otherwise it looks half-broken)
+local function fadeIn()
+	local ti = TweenInfo.new(0.28, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
 
--- getWorldCamera exists so fov effects survive CurrentCamera swaps
-local function getWorldCamera(): Camera?
-	return Workspace.CurrentCamera
-end
-
--- newInstance exists so object construction stays consistent and easy to audit
-local function newInstance<T>(className: string, props: { [string]: any }?, parent: Instance?): T
-	local inst = Instance.new(className)
-	if props then
-		for k, v in pairs(props) do
-			(inst :: any)[k] = v
+	holder.BackgroundTransparency = 1
+	for _, child in holder:GetDescendants() do
+		if child:IsA("TextLabel") then
+			child.TextTransparency = 1
+		elseif child:IsA("Frame") and child.Name ~= "Header" and child.Name ~= "ViewportContainer" then
+			-- leave layout containers alone; only fade the real visible frames (dots, pills, etc)
+			child.BackgroundTransparency = 1
 		end
 	end
-	if parent then
-		inst.Parent = parent
+
+	Utils.tween(holder, ti, { BackgroundTransparency = 0.04 })
+
+	-- viewport tiles are their own frames, so fade those too
+	for _, vp in vpContainer:GetChildren() do
+		if vp:IsA("Frame") then
+			vp.BackgroundTransparency = 1
+			Utils.tween(vp, ti, { BackgroundTransparency = 0 })
+		end
 	end
-	return inst :: any
+
+	-- header has a mix of labels + frames
+	for _, child in header:GetDescendants() do
+		if child:IsA("TextLabel") then
+			Utils.tween(child, ti, { TextTransparency = 0 })
+		elseif child:IsA("Frame") then
+			Utils.tween(child, ti, { BackgroundTransparency = 0 })
+		end
+	end
 end
 
--- playTween exists so animations don’t repeat boilerplate and stay consistent
-local function playTween(inst: Instance, info: TweenInfo, props: { [string]: any })
-	local t = TweenService:Create(inst, info, props)
-	t:Play()
-	return t
+-- fadeOut doesn't reset anything; I want it to fade from whatever state it's currently at
+-- the real "turn off" happens later in disable() after the tween finishes
+local function fadeOut()
+	local ti = TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+
+	Utils.tween(holder, ti, { BackgroundTransparency = 1 })
+
+	for _, vp in vpContainer:GetChildren() do
+		if vp:IsA("Frame") then
+			Utils.tween(vp, ti, { BackgroundTransparency = 1 })
+		end
+	end
+
+	for _, child in header:GetDescendants() do
+		if child:IsA("TextLabel") then
+			Utils.tween(child, ti, { TextTransparency = 1 })
+		elseif child:IsA("Frame") then
+			Utils.tween(child, ti, { BackgroundTransparency = 1 })
+		end
+	end
 end
 
--- clamp01 exists so lerp alpha can be frame-rate independent without overshooting
-local function clamp01(x: number): number
-	return math.clamp(x, 0, 1)
-end
-
-local currentChar: Model?
-local rootPart: BasePart?
-
-local uiEnabled = false
-
-local screenGui: ScreenGui?
-local holderFrame: Frame?
-local viewports: { [ViewKey]: ViewportFrame } = {}
-
-type Rig = {
-	key: ViewKey,
-	world: WorldModel,
-	model: Model,
-	partMap: { [BasePart]: BasePart },
-	rootClone: BasePart,
-	camera: Camera,
-}
-
-local rigs: { Rig } = {}
-
-local renderConn: RBXScriptConnection?
-local baseWorldFov: number?
-local cctvEffect: ColorCorrectionEffect?
-
-local focusedViewKey: ViewKey?
-local fullFrame: Frame?
-local fullViewport: ViewportFrame?
-
-local uiSessionId = 0
-
--- refreshCharacter exists so per-frame code doesn’t search the character hierarchy repeatedly
+-- pull fresh character refs
+-- I keep rootPart cached because everything (rig follow / offsets) is based on that
 local function refreshCharacter()
-	currentChar = player.Character
-	if not currentChar then
+	character = player.Character
+	if not character then
 		rootPart = nil
 		return
 	end
 
-	local hrp = currentChar:FindFirstChild("HumanoidRootPart")
-	if hrp and hrp:IsA("BasePart") then
-		rootPart = hrp
-	else
-		rootPart = currentChar.PrimaryPart
-	end
+	local hrp = character:FindFirstChild("HumanoidRootPart")
+	-- HRP is the normal case; PrimaryPart is the backup for weird rigs
+	rootPart = if hrp and hrp:IsA("BasePart") then hrp else character.PrimaryPart
 end
 
--- ensureCctvEffect exists so visual grading is tied to enable/disable lifecycle
-local function ensureCctvEffect()
-	if cctvEffect and cctvEffect.Parent then
-		return
-	end
-
-	cctvEffect = newInstance("ColorCorrectionEffect", {
-		Name = "CCTVColor",
-		Brightness = -0.03,
-		Contrast = 0.25,
-		Saturation = -0.2,
-		TintColor = Color3.fromRGB(230, 235, 255),
-	}, Lighting)
-end
-
--- destroyRigs exists so toggling can’t leak WorldModels and slowly degrade performance
+-- clean rigs properly (each rig owns a WorldModel + camera setup)
 local function destroyRigs()
-	for _, rig in ipairs(rigs) do
-		if rig.world and rig.world.Parent then
-			rig.world:Destroy()
-		end
+	for _, rig in rigs do
+		CameraRig.destroy(rig)
 	end
 	table.clear(rigs)
 end
 
--- destroyUi exists so the script leaves PlayerGui clean after disable
-local function destroyUi()
-	if screenGui and screenGui.Parent then
-		screenGui:Destroy()
-	end
-	screenGui = nil
-	holderFrame = nil
-	table.clear(viewports)
-	fullFrame = nil
-	fullViewport = nil
-end
+-- rebuild all rigs (used on enable + respawn)
+-- destroy first so I never end up with duplicate WorldModels sitting in viewports
+local function buildRigs()
+	destroyRigs()
+	refreshCharacter()
 
--- clearFullscreen exists so worlds always return to their small viewport before overlay cleanup
-local function clearFullscreen()
-	if not focusedViewKey then
-		return
-	end
+	-- if you're between spawns, just don't build yet
+	if not character or not rootPart then return end
 
-	if fullViewport then
-		fullViewport.CurrentCamera = nil
-	end
-
-	for _, rig in ipairs(rigs) do
-		if rig.key == focusedViewKey then
-			local smallViewport = viewports[focusedViewKey]
-			if smallViewport then
-				rig.world.Parent = smallViewport
-				smallViewport.CurrentCamera = rig.camera
-			end
-			break
+	-- one rig per viewport (rear/side/top)
+	for viewKey, viewport in viewports do
+		local rig = CameraRig.create(viewKey, character, rootPart, viewport)
+		if rig then
+			table.insert(rigs, rig)
 		end
 	end
-
-	if fullFrame then
-		fullFrame:Destroy()
-	end
-
-	fullFrame = nil
-	fullViewport = nil
-	focusedViewKey = nil
 end
 
--- buildUi exists so the rest of the script can assume viewports are present and stable
-local function buildUi()
-	if screenGui and screenGui.Parent then
-		return
+-- rigs is tiny (3), so linear search is totally fine and keeps the rest simple
+local function findRig(viewKey)
+	for _, rig in rigs do
+		if rig.viewKey == viewKey then return rig end
+	end
+	return nil
+end
+
+-- RenderStepped update
+-- main idea: rigs mirror the real character pose into clones, then update their cameras smoothly
+local function onRender(dt)
+	-- cheap guards first (RenderStepped is hot)
+	if not enabled or #rigs == 0 then return end
+	if not character or not character.Parent then return end
+	if not rootPart or not rootPart.Parent then return end
+
+	local t = os.clock()
+
+	for _, rig in rigs do
+		-- copy live character pose into the rig's clone world
+		CameraRig.syncPose(rig)
+
+		-- update the rig camera (lerp + wobble uses time)
+		CameraRig.updateCamera(rig, dt, t)
+	end
+end
+
+-- fullscreen works by moving the *same* WorldModel between viewports
+-- no rebuild = no GC spikes + you keep camera smoothing state
+local function exitFullscreen()
+	if not focusedView then return end
+
+	local rig = findRig(focusedView)
+	local smallVp = viewports[focusedView]
+
+	-- put the world back + make sure the small viewport points at the right camera again
+	if rig and smallVp then
+		rig.world.Parent = smallVp
+		smallVp.CurrentCamera = rig.camera
 	end
 
-	local playerGui = player:WaitForChild("PlayerGui")
-
-	screenGui = newInstance("ScreenGui", {
-		Name = "CCTVHud",
-		ResetOnSpawn = false,
-		IgnoreGuiInset = true,
-	}, playerGui)
-
-	holderFrame = newInstance("Frame", {
-		Name = "Holder",
-		AnchorPoint = Vector2.new(1, 1),
-		Position = UDim2.new(1, -24, 1, -24),
-		Size = UDim2.new(0, 540, 0, 220),
-		BackgroundColor3 = Color3.fromRGB(4, 4, 8),
-		BackgroundTransparency = 1,
-		BorderSizePixel = 0,
-	}, screenGui)
-
-	newInstance("UIStroke", {
-		Thickness = 2,
-		Color = Color3.fromRGB(235, 235, 245),
-		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
-	}, holderFrame)
-
-	newInstance("UICorner", { CornerRadius = UDim.new(0, 10) }, holderFrame)
-
-	newInstance("UIPadding", {
-		PaddingTop = UDim.new(0, 8),
-		PaddingBottom = UDim.new(0, 8),
-		PaddingLeft = UDim.new(0, 10),
-		PaddingRight = UDim.new(0, 10),
-	}, holderFrame)
-
-	local title = newInstance("TextLabel", {
-		Name = "Title",
-		BackgroundTransparency = 1,
-		Size = UDim2.new(0.6, 0, 0, 20),
-		Position = UDim2.new(0, 0, 0, 0),
-		Font = Enum.Font.GothamMedium,
-		Text = "CCTV // MULTI-FEED",
-		TextXAlignment = Enum.TextXAlignment.Left,
-		TextColor3 = Color3.fromRGB(235, 235, 245),
-		TextSize = 14,
-		TextTransparency = 1,
-	}, holderFrame)
-
-	local subtitle = newInstance("TextLabel", {
-		Name = "Subtitle",
-		BackgroundTransparency = 1,
-		Size = UDim2.new(0.9, 0, 0, 16),
-		Position = UDim2.new(0, 0, 0, 18),
-		Font = Enum.Font.Gotham,
-		Text = "CAM 01 / REAR   •   CAM 02 / PROFILE   •   CAM 03 / OVERHEAD",
-		TextXAlignment = Enum.TextXAlignment.Left,
-		TextColor3 = Color3.fromRGB(170, 170, 190),
-		TextSize = 11,
-		TextTransparency = 1,
-	}, holderFrame)
-
-	local recLabel = newInstance("TextLabel", {
-		Name = "RecLabel",
-		AnchorPoint = Vector2.new(1, 0),
-		Position = UDim2.new(1, -10, 0, 0),
-		Size = UDim2.new(0, 60, 0, 20),
-		BackgroundTransparency = 1,
-		Font = Enum.Font.Gotham,
-		Text = "REC",
-		TextXAlignment = Enum.TextXAlignment.Right,
-		TextColor3 = Color3.fromRGB(255, 255, 255),
-		TextSize = 11,
-		TextTransparency = 1,
-	}, holderFrame)
-
-	local recDot = newInstance("Frame", {
-		Name = "RecDot",
-		AnchorPoint = Vector2.new(1, 0.5),
-		Position = UDim2.new(1, -36, 0.5, 0),
-		Size = UDim2.new(0, 8, 0, 8),
-		BackgroundColor3 = Color3.fromRGB(255, 70, 70),
-		BackgroundTransparency = 1,
-		BorderSizePixel = 0,
-	}, holderFrame)
-
-	newInstance("UICorner", { CornerRadius = UDim.new(1, 0) }, recDot)
-
-	local timeLabel = newInstance("TextLabel", {
-		Name = "Clock",
-		AnchorPoint = Vector2.new(1, 0),
-		Position = UDim2.new(1, -10, 0, 18),
-		Size = UDim2.new(0, 90, 0, 16),
-		BackgroundTransparency = 1,
-		Font = Enum.Font.Code,
-		Text = "00:00:00",
-		TextXAlignment = Enum.TextXAlignment.Right,
-		TextColor3 = Color3.fromRGB(200, 200, 220),
-		TextSize = 11,
-		TextTransparency = 1,
-	}, holderFrame)
-
-	local vpHolder = newInstance("Frame", {
-		Name = "ViewportHolder",
-		BackgroundTransparency = 1,
-		BorderSizePixel = 0,
-		Position = UDim2.new(0, 0, 0, 40),
-		Size = UDim2.new(1, 0, 1, -48),
-	}, holderFrame)
-
-	newInstance("UIListLayout", {
-		FillDirection = Enum.FillDirection.Horizontal,
-		HorizontalAlignment = Enum.HorizontalAlignment.Center,
-		VerticalAlignment = Enum.VerticalAlignment.Center,
-		Padding = UDim.new(0, 6),
-	}, vpHolder)
-
-	local function makeViewport(): ViewportFrame
-		local vp = newInstance("ViewportFrame", {
-			Name = "View",
-			BackgroundColor3 = Color3.fromRGB(10, 10, 16),
-			BorderSizePixel = 0,
-			Size = UDim2.new(0.33, -4, 1, 0),
-			BackgroundTransparency = 1,
-			LightColor = Color3.fromRGB(255, 255, 255),
-			LightDirection = Vector3.new(-0.6, -1, -0.4),
-			Ambient = Color3.fromRGB(70, 70, 90),
-		}, vpHolder)
-
-		newInstance("UICorner", { CornerRadius = UDim.new(0, 8) }, vp)
-		newInstance("UIStroke", {
-			Thickness = 1,
-			Color = Color3.fromRGB(200, 200, 220),
-			ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
-			Transparency = 0.2,
-		}, vp)
-
-		return vp
-	end
-
-	viewports = {
-		rear = makeViewport(),
-		side = makeViewport(),
-		top = makeViewport(),
-	}
-
-	local ti = TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
-	playTween(holderFrame, ti, { BackgroundTransparency = 0.08 })
-	for _, vp in pairs(viewports) do
-		playTween(vp, ti, { BackgroundTransparency = 0 })
-	end
-	playTween(title, ti, { TextTransparency = 0 })
-	playTween(subtitle, ti, { TextTransparency = 0.1 })
-	playTween(recLabel, ti, { TextTransparency = 0 })
-	playTween(recDot, ti, { BackgroundTransparency = 0 })
-	playTween(timeLabel, ti, { TextTransparency = 0 })
-
-	uiSessionId += 1
-	local mySession = uiSessionId
-
-	task.spawn(function()
-		while uiEnabled and screenGui and mySession == uiSessionId do
-			recDot.BackgroundTransparency = 0
-			task.wait(0.6)
-			recDot.BackgroundTransparency = 0.5
-			task.wait(0.4)
-		end
+	-- fade overlay out, then hide it
+	Utils.tween(fullOverlay, TweenInfo.new(0.18, Enum.EasingStyle.Quad), { BackgroundTransparency = 1 })
+	task.delay(0.2, function()
+		fullOverlay.Visible = false
 	end)
 
-	local startClock = os.clock()
+	focusedView = nil
+end
+
+-- enter fullscreen for a view key
+-- pressing the same key again = toggle off
+-- switching views = exit first so the world isn't "owned" by two viewports at once
+local function enterFullscreen(viewKey)
+	if focusedView == viewKey then
+		exitFullscreen()
+		return
+	end
+
+	if focusedView then
+		exitFullscreen()
+		task.wait(0.1)
+	end
+
+	local rig = findRig(viewKey)
+	if not rig then return end
+
+	local cfg = Config.views[viewKey]
+
+	-- keep UI text driven by config so bind + label never drift
+	fullCamLabel.Text = cfg.label
+	fullHint.Text = "PRESS " .. cfg.hint .. " TO EXIT"
+
+	-- the actual swap: reparent world into fullscreen viewport and point it at the rig camera
+	rig.world.Parent = fullViewport
+	fullViewport.CurrentCamera = rig.camera
+
+	fullOverlay.BackgroundTransparency = 1
+	fullOverlay.Visible = true
+	Utils.tween(fullOverlay, TweenInfo.new(0.22, Enum.EasingStyle.Quad), { BackgroundTransparency = 0.2 })
+
+	focusedView = viewKey
+end
+
+-- UI loops (clock + rec blink)
+-- sessionId check is what stops these from lingering after disable without having to store extra flags
+local function startUiLoops(mySession)
+	local startTime = os.clock()
+	local clock = header:FindFirstChild("Clock")
+	local recDot = header:FindFirstChild("RecHolder") and header.RecHolder:FindFirstChild("RecDot")
+
+	-- elapsed timer (uses os.clock so it won't jump around)
 	task.spawn(function()
-		while uiEnabled and screenGui and mySession == uiSessionId do
-			local t = math.max(0, math.floor(os.clock() - startClock))
-			local s = t % 60
-			local m = math.floor(t / 60) % 60
-			local h = math.floor(t / 3600)
-			timeLabel.Text = string.format("%02d:%02d:%02d", h, m, s)
+		while enabled and sessionId == mySession do
+			if clock then
+				local elapsed = math.max(0, math.floor(os.clock() - startTime))
+				clock.Text = Utils.formatTime(elapsed)
+			end
 			task.wait(0.25)
 		end
 	end)
+
+	-- blinking REC dot (slightly uneven timing feels nicer than perfect 50/50)
+	task.spawn(function()
+		while enabled and sessionId == mySession do
+			if recDot then
+				recDot.BackgroundTransparency = 0
+				task.wait(0.55)
+				recDot.BackgroundTransparency = 0.5
+				task.wait(0.45)
+			else
+				task.wait(0.5)
+			end
+		end
+	end)
 end
 
--- fadeUiOut exists so disabling doesn’t pop the hud and gives a clear “mode off” signal
-local function fadeUiOut()
-	if not screenGui or not holderFrame then
-		destroyUi()
+-- enable order matters:
+-- show UI first (instant feedback) -> postfx -> build rigs -> connect render loop -> start UI loops
+local function enable()
+	if enabled then return end
+
+	refreshCharacter()
+	if not character or not rootPart then
+		warn("[CCTV] No character")
 		return
 	end
 
-	local ti = TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
-	playTween(holderFrame, ti, { BackgroundTransparency = 1 })
-	for _, vp in pairs(viewports) do
-		playTween(vp, ti, { BackgroundTransparency = 1 })
-	end
+	enabled = true
+	sessionId += 1
+	local mySession = sessionId
 
+	screenGui.Enabled = true
+	fadeIn()
+
+	Effects.enableCC()
+	Effects.pulseCamera()
+
+	buildRigs()
+
+	-- disconnect first so double-enables don't stack RenderStepped connections
+	Utils.disconnect(renderConn)
+	renderConn = RunService.RenderStepped:Connect(onRender)
+
+	startUiLoops(mySession)
+end
+
+-- disable is basically the reverse:
+-- stop per-frame work immediately -> exit fullscreen while rigs still exist -> fade -> cleanup after fade
+local function disable()
+	if not enabled then return end
+
+	enabled = false
+	sessionId += 1
+
+	Utils.disconnect(renderConn)
+	renderConn = nil
+
+	exitFullscreen()
+
+	Effects.resetCamera()
+	fadeOut()
+
+	-- let the fade finish before nuking rigs/UI
 	task.delay(0.22, function()
-		destroyUi()
-	end)
-end
-
--- createClonePart exists to avoid cloning live character parts which can inherit invisibility modifiers
-local function createClonePart(original: BasePart, parentModel: Model): BasePart
-	return newInstance("Part", {
-		Name = original.Name,
-		Size = original.Size,
-		Anchored = true,
-		CanCollide = false,
-		CanTouch = false,
-		CanQuery = false,
-		Massless = true,
-		Material = Enum.Material.SmoothPlastic,
-		Color = Color3.fromRGB(235, 235, 235),
-		Transparency = 0.18,
-		CastShadow = false,
-		CFrame = original.CFrame,
-	}, parentModel)
-end
-
--- buildRig exists so each feed has an isolated WorldModel and camera without touching the live world
-local function buildRig(viewKey: ViewKey): Rig?
-	refreshCharacter()
-	if not currentChar or not rootPart then
-		return nil
-	end
-
-	local viewport = viewports[viewKey]
-	if not viewport then
-		return nil
-	end
-
-	local world = newInstance("WorldModel", { Name = "CCTVWorld_" .. viewKey }, viewport)
-	local rigModel = newInstance("Model", { Name = "CCTVRig_" .. viewKey }, world)
-
-	local partMap: { [BasePart]: BasePart } = {}
-	local rootClone: BasePart? = nil
-
-	for _, inst in ipairs(currentChar:GetDescendants()) do
-		if inst:IsA("BasePart") then
-			local original = inst :: BasePart
-			local clone = createClonePart(original, rigModel)
-			partMap[original] = clone
-
-			if original == rootPart then
-				rootClone = clone
-			end
-		end
-	end
-
-	if not rootClone then
-		rootClone = createClonePart(rootPart, rigModel)
-		rootClone.Name = "RootClone"
-	end
-
-	local cam = newInstance("Camera", {
-		Name = "CCTVCam_" .. viewKey,
-		FieldOfView = 45,
-	}, world)
-
-	viewport.CurrentCamera = cam
-
-	return {
-		key = viewKey,
-		world = world,
-		model = rigModel,
-		partMap = partMap,
-		rootClone = rootClone,
-		camera = cam,
-	}
-end
-
--- buildAllRigs exists so the hud always shows a complete set of feeds or none at all
-local function buildAllRigs()
-	destroyRigs()
-	if not (viewports.rear and viewports.side and viewports.top) then
-		return
-	end
-
-	local rearRig = buildRig("rear")
-	local sideRig = buildRig("side")
-	local topRig = buildRig("top")
-
-	if rearRig then table.insert(rigs, rearRig) end
-	if sideRig then table.insert(rigs, sideRig) end
-	if topRig then table.insert(rigs, topRig) end
-end
-
--- updateRigs exists to mirror the live character pose without affecting gameplay physics or replication
-local function updateRigs(dt: number)
-	if not uiEnabled then
-		return
-	end
-	if #rigs == 0 then
-		return
-	end
-	if not currentChar or not currentChar.Parent then
-		return
-	end
-	if not rootPart or not rootPart.Parent then
-		return
-	end
-
-	for _, rig in ipairs(rigs) do
-		for original, clone in pairs(rig.partMap) do
-			if original.Parent and clone.Parent then
-				clone.CFrame = original.CFrame
-			end
-		end
-	end
-
-	local now = os.clock()
-
-	for _, rig in ipairs(rigs) do
-		local cfg = viewConfigs[rig.key]
-		local rootPos = rig.rootClone.Position
-		local origin = rootPos + cfg.originOffset
-
-		local wobble = cfg.wobbleAmp * math.sin(now * cfg.wobbleSpeed + cfg.pulsePhase)
-		local camPos = origin + cfg.cameraOffset + Vector3.new(0, wobble, 0)
-
-		rig.camera.CFrame = rig.camera.CFrame:Lerp(
-			CFrame.new(camPos, origin),
-			clamp01(dt * 10)
-		)
-
-		local pulse = cfg.pulseAmp * math.sin(now * cfg.pulseSpeed + cfg.pulsePhase)
-		rig.camera.FieldOfView = cfg.baseFov + pulse
-	end
-end
-
--- pulseWorldCamera exists to make mode entry obvious without changing camera ownership long-term
-local function pulseWorldCamera()
-	local cam = getWorldCamera()
-	if not cam then
-		return
-	end
-
-	baseWorldFov = baseWorldFov or cam.FieldOfView
-
-	local upInfo = TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
-	local downInfo = TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
-
-	local up = TweenService:Create(cam, upInfo, { FieldOfView = (baseWorldFov :: number) + 6 })
-	local down = TweenService:Create(cam, downInfo, { FieldOfView = baseWorldFov :: number })
-
-	up.Completed:Connect(function()
-		down:Play()
+		destroyRigs()
+		screenGui.Enabled = false
 	end)
 
-	up:Play()
+	Effects.disableCC()
 end
 
--- resetWorldFov exists so the script never leaves the main camera modified after disable
-local function resetWorldFov()
-	local cam = getWorldCamera()
-	if not cam or not baseWorldFov then
-		return
-	end
-
-	local ti = TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
-	playTween(cam, ti, { FieldOfView = baseWorldFov })
+local function toggle()
+	if enabled then disable() else enable() end
 end
 
--- enterFocus exists so fullscreen shows the same feed by reparenting the existing WorldModel
-local function enterFocus(viewKey: ViewKey)
-	if not uiEnabled or not screenGui or not holderFrame then
-		return
-	end
-
-	if focusedViewKey == viewKey then
-		clearFullscreen()
-		return
-	end
-
-	clearFullscreen()
-
-	fullFrame = newInstance("Frame", {
-		Name = "FullCCTV",
-		Size = UDim2.new(1, 0, 1, 0),
-		Position = UDim2.new(0, 0, 0, 0),
-		BackgroundColor3 = Color3.fromRGB(0, 0, 0),
-		BackgroundTransparency = 1,
-		BorderSizePixel = 0,
-		ZIndex = 5,
-	}, screenGui)
-
-	fullViewport = newInstance("ViewportFrame", {
-		Name = "FullViewport",
-		AnchorPoint = Vector2.new(0.5, 0.5),
-		Position = UDim2.new(0.5, 0, 0.5, 0),
-		Size = UDim2.new(0.7, 0, 0.7, 0),
-		BackgroundColor3 = Color3.fromRGB(5, 5, 10),
-		BackgroundTransparency = 0,
-		BorderSizePixel = 0,
-		LightColor = Color3.fromRGB(255, 255, 255),
-		LightDirection = Vector3.new(-0.6, -1, -0.4),
-		Ambient = Color3.fromRGB(70, 70, 90),
-		ZIndex = 6,
-	}, fullFrame)
-
-	newInstance("UICorner", { CornerRadius = UDim.new(0, 10) }, fullViewport)
-	newInstance("UIStroke", {
-		Thickness = 2,
-		Color = Color3.fromRGB(230, 230, 240),
-		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
-		Transparency = 0.15,
-	}, fullViewport)
-
-	local cfg = viewConfigs[viewKey]
-
-	newInstance("TextLabel", {
-		Name = "OverlayLabel",
-		BackgroundTransparency = 1,
-		Size = UDim2.new(1, -30, 0, 24),
-		Position = UDim2.new(0, 20, 0, 14),
-		Font = Enum.Font.GothamMedium,
-		TextXAlignment = Enum.TextXAlignment.Left,
-		TextColor3 = Color3.fromRGB(230, 230, 240),
-		TextSize = 16,
-		ZIndex = 7,
-		Text = cfg.fullLabel,
-	}, fullFrame)
-
-	newInstance("TextLabel", {
-		Name = "Hint",
-		BackgroundTransparency = 1,
-		AnchorPoint = Vector2.new(1, 1),
-		Position = UDim2.new(1, -24, 1, -18),
-		Size = UDim2.new(0, 220, 0, 18),
-		Font = Enum.Font.Gotham,
-		Text = "PRESS " .. cfg.hintKey .. " TO EXIT",
-		TextXAlignment = Enum.TextXAlignment.Right,
-		TextColor3 = Color3.fromRGB(200, 200, 220),
-		TextSize = 11,
-		TextTransparency = 0.1,
-		ZIndex = 7,
-	}, fullFrame)
-
-	for _, rig in ipairs(rigs) do
-		if rig.key == viewKey then
-			rig.world.Parent = fullViewport
-			fullViewport.CurrentCamera = rig.camera
-			break
-		end
-	end
-
-	playTween(fullFrame, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
-		BackgroundTransparency = 0.3,
-	})
-
-	focusedViewKey = viewKey
-end
-
--- enableHud exists to build state in one place so toggling stays predictable
-local function enableHud()
-	if uiEnabled then
-		return
-	end
-
-	refreshCharacter()
-	if not currentChar or not rootPart then
-		return
-	end
-
-	uiEnabled = true
-	ensureCctvEffect()
-	buildUi()
-	buildAllRigs()
-	pulseWorldCamera()
-
-	if renderConn then
-		renderConn:Disconnect()
-	end
-	renderConn = RunService.RenderStepped:Connect(updateRigs)
-end
-
--- disableHud exists to tear down safely so nothing references destroyed instances
-local function disableHud()
-	if not uiEnabled then
-		return
-	end
-
-	uiEnabled = false
-	uiSessionId += 1
-
-	if renderConn then
-		renderConn:Disconnect()
-		renderConn = nil
-	end
-
-	clearFullscreen()
-	resetWorldFov()
-	fadeUiOut()
-	destroyRigs()
-
-	if cctvEffect and cctvEffect.Parent then
-		cctvEffect:Destroy()
-	end
-	cctvEffect = nil
-end
-
-local function toggleHud()
-	if uiEnabled then
-		disableHud()
-	else
-		enableHud()
-	end
-end
-
--- character hooks exist so rigs rebuild after respawn without forcing a script restart
-local function onCharacterAdded(char: Model)
-	currentChar = char
-
+-- respawn hook
+-- if the system is on, rebuild rigs so the clone worlds match the new character model
+local function onCharacterAdded(char)
+	character = char
 	local hrp = char:FindFirstChild("HumanoidRootPart")
-	if hrp and hrp:IsA("BasePart") then
-		rootPart = hrp
-	else
-		rootPart = char.PrimaryPart
-	end
+	rootPart = if hrp and hrp:IsA("BasePart") then hrp else char.PrimaryPart
 
-	if uiEnabled then
-		buildAllRigs()
+	if enabled then
+		buildRigs()
 	end
 end
 
+-- character is about to be destroyed, so drop refs and clean rigs before they point at dead instances
 local function onCharacterRemoving()
-	currentChar = nil
+	character = nil
 	rootPart = nil
-
-	clearFullscreen()
+	exitFullscreen()
 	destroyRigs()
 end
 
-if player.Character then
-	onCharacterAdded(player.Character)
+-- init runs once from the LocalScript
+-- grabs UI refs, wires input, and hooks character/camera changes
+function Controller.init()
+	-- timeout so I don't yield forever if the UI isn't in PlayerGui
+	screenGui = playerGui:WaitForChild("CCTVInterface", 10)
+	if not screenGui then
+		warn("[CCTV] UI not found")
+		return
+	end
+
+	holder = screenGui:WaitForChild("Holder")
+	header = holder:WaitForChild("Header")
+	vpContainer = holder:WaitForChild("ViewportContainer")
+	fullOverlay = screenGui:WaitForChild("FullscreenOverlay")
+
+	-- cache viewport frames once; CameraRig just needs a parent, not the whole UI path
+	viewports = {
+		rear = vpContainer:WaitForChild("VP_rear"):WaitForChild("Viewport"),
+		side = vpContainer:WaitForChild("VP_side"):WaitForChild("Viewport"),
+		top = vpContainer:WaitForChild("VP_top"):WaitForChild("Viewport"),
+	}
+
+	fullViewport = fullOverlay:WaitForChild("FullViewportFrame"):WaitForChild("Viewport")
+	fullCamLabel = fullOverlay:WaitForChild("CamLabel")
+	fullHint = fullOverlay:WaitForChild("ExitHint")
+
+	-- input:
+	-- gpe check stops toggling while typing in a textbox etc
+	-- toggle key works always; view keys only do something when enabled
+	UserInputService.InputBegan:Connect(function(input, gpe)
+		if gpe then return end
+		if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+
+		if input.KeyCode == Config.toggleKey then
+			toggle()
+			return
+		end
+
+		if not enabled then return end
+
+		for viewKey, keyCode in Config.viewKeys do
+			if input.KeyCode == keyCode then
+				enterFullscreen(viewKey)
+				return
+			end
+		end
+	end)
+
+	-- if something swaps Workspace.CurrentCamera (cutscenes), Effects needs to recache baseline fov
+	Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+		Effects.updateStoredFov()
+	end)
+
+	-- late join: if the character already exists, run the same setup path
+	if player.Character then
+		onCharacterAdded(player.Character)
+	end
+	player.CharacterAdded:Connect(onCharacterAdded)
+	player.CharacterRemoving:Connect(onCharacterRemoving)
 end
 
-player.CharacterAdded:Connect(onCharacterAdded)
-player.CharacterRemoving:Connect(onCharacterRemoving)
-
--- input stays minimal so reviewers can quickly verify state transitions and keybinds
-UserInputService.InputBegan:Connect(function(input: InputObject, gpe: boolean)
-	if gpe then
-		return
-	end
-	if input.UserInputType ~= Enum.UserInputType.Keyboard then
-		return
-	end
-
-	if input.KeyCode == toggleKey then
-		toggleHud()
-		return
-	end
-
-	if not uiEnabled then
-		return
-	end
-
-	if input.KeyCode == Enum.KeyCode.One then
-		enterFocus("rear")
-	elseif input.KeyCode == Enum.KeyCode.Two then
-		enterFocus("side")
-	elseif input.KeyCode == Enum.KeyCode.Three then
-		enterFocus("top")
-	end
-end)
-
--- camera watcher exists so baseWorldFov stays correct if Roblox replaces CurrentCamera
-Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
-	local cam = Workspace.CurrentCamera
-	if cam then
-		baseWorldFov = cam.FieldOfView
-	end
-end)
+return Controller
