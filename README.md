@@ -1,469 +1,511 @@
-local players = game:GetService("Players")
-local runService = game:GetService("RunService")
-local userInputService = game:GetService("UserInputService")
-local tweenService = game:GetService("TweenService")
-local debris = game:GetService("Debris")
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
 
-local player = players.LocalPlayer
-local camera = workspace.CurrentCamera
+-- playerRefs
+local player = Players.LocalPlayer
+local gui = player:WaitForChild("PlayerGui"):WaitForChild("BuildingUI")
+local mouse = player:GetMouse()
 
-local astralKey = Enum.KeyCode.R
+-- storageRefs
+-- BuildingSystem contains modules and remotes; Mereology is the template library used for inventory + placement
+local system = ReplicatedStorage:WaitForChild("BuildingSystem")
+local modules = system:WaitForChild("Modules")
+local mereology = ReplicatedStorage:WaitForChild("Mereology")
 
-local astralActive = false
-local astralPos
-local astralStartTime = 0
-local maxAstralTime = 12
+-- moduleImports
+-- this script intentionally does not implement placement/deletion logic; it delegates behavior to focused modules
+local Placement = require(modules:WaitForChild("PlacementModule"))
+local Deletion = require(modules:WaitForChild("DeletionModule"))
+local UI = require(modules:WaitForChild("UIModule"))
+local Viewport = require(modules:WaitForChild("ViewportHandler"))
+local Grid = require(modules:WaitForChild("GridModule"))
+local History = require(modules:WaitForChild("HistoryModule"))
 
-local ghostModel
-local ghostRootPart
-local ghostParts = {}
-local bodyAttachment
-local ghostAttachment
-local tetherBeam
+-- moduleInstances
+-- these are stateful objects that manage their own connections/preview state internally
+local placement = Placement.new(player, mouse)
+local deletion = Deletion.new(player, mouse)
+local ui = UI.new(gui)
+local grid = Grid.new(2)
+local history = History.new()
 
-local humanoid
-local rootPart
-local savedWalkSpeed
-local savedJumpPower
-local savedAutoRotate
-local savedPlatformStand
-local savedRootAnchored
-local animateScript
-local savedAnimateDisabled
+-- gridWiring
+-- placement uses grid snapping; the grid module is passed in so snapping rules can be toggled without changing placement code
+placement:SetGrid(grid)
 
-local originalCameraType
-local originalCameraSubject
-local originalMouseBehavior
-local originalMouseIcon
-local originalFov
+-- controllerState
+-- mode is the controller truth; placing is a tighter flag used to know if placement preview is actively running
+local mode = "none"
+local placing = false
+local placedObjects = {} -- kept for compatibility; history is the actual undo/redo source in this controller
 
-local keyDown = {
-	w = false,
-	a = false,
-	s = false,
-	d = false,
-	space = false,
-	shift = false
-}
-
-local yaw = 0
-local pitch = 0
-
-local renderConn
-local mouseConn
-local charRemovingConn
-
-local function spawnShards(position)
-	for i = 1, 18 do
-		local p = Instance.new("Part")
-		p.Size = Vector3.new(0.16, 0.16, math.random(12, 24) / 10)
-		p.Anchored = true
-		p.CanCollide = false
-		p.Material = Enum.Material.Glass
-		p.Color = Color3.fromRGB(210, 230, 255)
-		p.Transparency = 0.25
-		p.CastShadow = false
-		p.CFrame = CFrame.new(position)
-		p.Parent = workspace
-
-		local dir = Vector3.new(
-			math.random() - 0.5,
-			math.random() - 0.2,
-			math.random() - 0.5
-		).Unit
-
-		local dist = math.random(8, 16) / 2
-		local targetPos = position + dir * dist
-
-		local tween = tweenService:Create(
-			p,
-			TweenInfo.new(0.4, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
-			{
-				CFrame = CFrame.new(targetPos) * CFrame.Angles(math.random(), math.random(), math.random()),
-				Transparency = 1
-			}
-		)
-		tween:Play()
-		debris:AddItem(p, 0.45)
-	end
-end
-
-local function destroyGhost()
-	if ghostModel then
-		for _, info in ipairs(ghostParts) do
-			if info.ghost and info.ghost.Parent then
-				tweenService:Create(
-					info.ghost,
-					TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
-					{Transparency = 1}
-				):Play()
-			end
-		end
-		debris:AddItem(ghostModel, 0.25)
-	end
-
-	if tetherBeam then
-		tweenService:Create(
-			tetherBeam,
-			TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
-			{Width0 = 0, Width1 = 0}
-		):Play()
-		debris:AddItem(tetherBeam, 0.22)
-	end
-
-	if bodyAttachment then bodyAttachment:Destroy() end
-	if ghostAttachment then ghostAttachment:Destroy() end
-
-	ghostModel = nil
-	ghostRootPart = nil
-	ghostParts = {}
-	bodyAttachment = nil
-	ghostAttachment = nil
-	tetherBeam = nil
-end
-
-local function buildGhost()
-	local character = player.Character
-	if not character then return end
-	rootPart = character:FindFirstChild("HumanoidRootPart")
-	if not rootPart then return end
-
-	ghostModel = Instance.new("Model")
-	ghostModel.Name = "AstralGhost"
-	ghostModel.Parent = workspace
-
-	ghostParts = {}
-	ghostRootPart = nil
-
-	for _, part in ipairs(character:GetDescendants()) do
-		if part:IsA("BasePart") then
-			local ghostPart = Instance.new("Part")
-			ghostPart.Size = part.Size
-			ghostPart.Anchored = true
-			ghostPart.CanCollide = false
-			ghostPart.Material = Enum.Material.ForceField
-			ghostPart.Color = Color3.fromRGB(190, 215, 255)
-			ghostPart.CastShadow = false
-			ghostPart.Transparency = 0.25
-			ghostPart.Name = "Ghost_" .. part.Name
-			ghostPart.CFrame = part.CFrame
-			ghostPart.Parent = ghostModel
-
-			local relative = rootPart.CFrame:ToObjectSpace(part.CFrame)
-			table.insert(ghostParts, {
-				ghost = ghostPart,
-				relative = relative
-			})
-
-			if part == rootPart then
-				ghostRootPart = ghostPart
-			end
-		end
-	end
-
-	if not ghostRootPart then
-		ghostRootPart = Instance.new("Part")
-		ghostRootPart.Size = Vector3.new(2, 2, 2)
-		ghostRootPart.Anchored = true
-		ghostRootPart.CanCollide = false
-		ghostRootPart.Material = Enum.Material.ForceField
-		ghostRootPart.Color = Color3.fromRGB(190, 215, 255)
-		ghostRootPart.CastShadow = false
-		ghostRootPart.Transparency = 0.25
-		ghostRootPart.CFrame = rootPart.CFrame
-		ghostRootPart.Name = "GhostRoot"
-		ghostRootPart.Parent = ghostModel
-		table.insert(ghostParts, {
-			ghost = ghostRootPart,
-			relative = CFrame.new()
-		})
-	end
-
-	bodyAttachment = Instance.new("Attachment")
-	bodyAttachment.Name = "AstralBodyAttachment"
-	bodyAttachment.Parent = rootPart
-
-	ghostAttachment = Instance.new("Attachment")
-	ghostAttachment.Name = "AstralGhostAttachment"
-	ghostAttachment.Parent = ghostRootPart
-
-	tetherBeam = Instance.new("Beam")
-	tetherBeam.Attachment0 = bodyAttachment
-	tetherBeam.Attachment1 = ghostAttachment
-	tetherBeam.FaceCamera = true
-	tetherBeam.LightEmission = 1
-	tetherBeam.LightInfluence = 0
-	tetherBeam.Width0 = 0.2
-	tetherBeam.Width1 = 0.2
-	tetherBeam.Segments = 32
-	tetherBeam.Color = ColorSequence.new(Color3.fromRGB(170, 210, 255), Color3.fromRGB(230, 150, 255))
-	tetherBeam.Transparency = NumberSequence.new(0.2, 0.4)
-	tetherBeam.CurveSize0 = 3
-	tetherBeam.CurveSize1 = -3
-	tetherBeam.Parent = ghostModel
-
-	astralPos = rootPart.Position + rootPart.CFrame.LookVector * 7 + Vector3.new(0, 3, 0)
-
-	local _, ry = rootPart.CFrame:ToEulerAnglesYXZ()
-	yaw = ry
-	pitch = 0
-end
-
-local function updateGhostCFrames(baseCFrame)
-	for _, info in ipairs(ghostParts) do
-		if info.ghost and info.ghost.Parent then
-			info.ghost.CFrame = baseCFrame * info.relative
-		end
-	end
-end
-
-local function setCharacterFrozen(state)
-	local character = player.Character
-	if not character then return end
-	humanoid = character:FindFirstChildOfClass("Humanoid")
-	rootPart = character:FindFirstChild("HumanoidRootPart")
-	if not humanoid or not rootPart then return end
-
-	if state then
-		savedWalkSpeed = humanoid.WalkSpeed
-		savedJumpPower = humanoid.JumpPower
-		savedAutoRotate = humanoid.AutoRotate
-		savedPlatformStand = humanoid.PlatformStand
-
-		humanoid.WalkSpeed = 0
-		humanoid.JumpPower = 0
-		humanoid.AutoRotate = false
-		humanoid.PlatformStand = true
-		humanoid:Move(Vector3.new(), false)
-
-		for _, track in ipairs(humanoid:GetPlayingAnimationTracks()) do
-			track:Stop(0.1)
-		end
-
-		savedRootAnchored = rootPart.Anchored
-		rootPart.Anchored = true
-
-		animateScript = character:FindFirstChild("Animate")
-		if animateScript then
-			savedAnimateDisabled = animateScript.Disabled
-			animateScript.Disabled = true
-		end
-	else
-		if humanoid and humanoid.Parent then
-			if savedWalkSpeed then humanoid.WalkSpeed = savedWalkSpeed end
-			if savedJumpPower then humanoid.JumpPower = savedJumpPower end
-			if savedAutoRotate ~= nil then humanoid.AutoRotate = savedAutoRotate end
-			if savedPlatformStand ~= nil then
-				humanoid.PlatformStand = savedPlatformStand
-			else
-				humanoid.PlatformStand = false
-			end
-			humanoid:Move(Vector3.new(), false)
-		end
-
-		if rootPart and rootPart.Parent then
-			if savedRootAnchored ~= nil then
-				rootPart.Anchored = savedRootAnchored
-			else
-				rootPart.Anchored = false
-			end
-		end
-
-		if animateScript and animateScript.Parent then
-			if savedAnimateDisabled ~= nil then
-				animateScript.Disabled = savedAnimateDisabled
-			else
-				animateScript.Disabled = false
-			end
-		end
-
-		savedWalkSpeed = nil
-		savedJumpPower = nil
-		savedAutoRotate = nil
-		savedPlatformStand = nil
-		savedRootAnchored = nil
-		animateScript = nil
-		savedAnimateDisabled = nil
-	end
-end
-
-local function stopAstral()
-	if not astralActive then return end
-	astralActive = false
-
-	if renderConn then
-		renderConn:Disconnect()
-		renderConn = nil
-	end
-	if mouseConn then
-		mouseConn:Disconnect()
-		mouseConn = nil
-	end
-	if charRemovingConn then
-		charRemovingConn:Disconnect()
-		charRemovingConn = nil
-	end
-
-	setCharacterFrozen(false)
-
-	if camera then
-		if originalCameraType then camera.CameraType = originalCameraType end
-		if originalCameraSubject then camera.CameraSubject = originalCameraSubject end
-		if originalFov then camera.FieldOfView = originalFov end
-	end
-
-	if userInputService then
-		userInputService.MouseBehavior = originalMouseBehavior or Enum.MouseBehavior.Default
-		if originalMouseIcon ~= nil then
-			userInputService.MouseIconEnabled = originalMouseIcon
-		else
-			userInputService.MouseIconEnabled = true
-		end
-	end
-
-	destroyGhost()
-
-	keyDown.w = false
-	keyDown.a = false
-	keyDown.s = false
-	keyDown.d = false
-	keyDown.space = false
-	keyDown.shift = false
-end
-
-local function startAstral()
-	if astralActive then
-		stopAstral()
+-- undoLogic
+-- undo reads the last action from history and reverses it by calling the same server remotes used for normal actions
+-- this means undo stays compatible with server validation rules and avoids client-only deletes/creates
+local function performUndo()
+	if not history:CanUndo() then
+		-- early exit avoids calling Undo() when the stack is empty, which keeps HistoryModule simpler
+		print("Nothing to undo")
 		return
 	end
 
-	local character = player.Character
-	if not character then return end
-	rootPart = character:FindFirstChild("HumanoidRootPart")
-	if not rootPart then return end
+	local action = history:Undo()
+	if action then
+		if action.type == "place" then
+			-- undoing a placement is equivalent to deleting that placed instance
+			-- we only attempt the delete if the object reference still exists and is parented
+			if action.object and action.object.Parent then
+				-- remotes are fetched at call-time to reduce coupling if the folder is reloaded or replaced during play
+				local remotes = ReplicatedStorage.BuildingSystem.RemoteEvents
+				local success = remotes.DeleteObject:InvokeServer(action.object)
+				if success then
+					-- destroying locally removes the instance immediately for the player; server should have already removed it too
+					action.object:Destroy()
+					print("Undid placement of", action.data.name)
+				end
+			else
+				-- object references can become invalid if the server already deleted it or it was cleaned up externally
+				print("Object no longer exists")
+			end
 
-	camera = workspace.CurrentCamera
-	if not camera then return end
-
-	astralActive = true
-	astralStartTime = tick()
-
-	originalCameraType = camera.CameraType
-	originalCameraSubject = camera.CameraSubject
-	originalMouseBehavior = userInputService.MouseBehavior
-	originalMouseIcon = userInputService.MouseIconEnabled
-	originalFov = camera.FieldOfView
-
-	camera.CameraType = Enum.CameraType.Scriptable
-	camera.CameraSubject = nil
-	userInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
-	userInputService.MouseIconEnabled = false
-
-	setCharacterFrozen(true)
-	buildGhost()
-	spawnShards(rootPart.Position)
-
-	mouseConn = userInputService.InputChanged:Connect(function(input, gpe)
-		if not astralActive then return end
-		if input.UserInputType == Enum.UserInputType.MouseMovement then
-			local sensitivity = 0.0025
-			yaw = yaw - input.Delta.X * sensitivity
-			pitch = math.clamp(pitch - input.Delta.Y * sensitivity, -1.35, 1.35)
+		elseif action.type == "delete" and action.data then
+			-- undoing a deletion is equivalent to re-placing the same template at the previous CFrame
+			local remotes = ReplicatedStorage.BuildingSystem.RemoteEvents
+			local success, obj = remotes.PlaceObject:InvokeServer(action.data.name, action.data.cf)
+			if success then
+				-- updating the action object reference makes redo work later (redo needs a live instance to delete again)
+				print("Undid deletion of", action.data.name)
+				action.object = obj
+			end
 		end
-	end)
-
-	renderConn = runService.RenderStepped:Connect(function(dt)
-		if not astralActive then return end
-		if not ghostRootPart or not ghostRootPart.Parent then
-			stopAstral()
-			return
-		end
-
-		if tick() - astralStartTime > maxAstralTime then
-			stopAstral()
-			return
-		end
-
-		local moveVec = Vector3.new(0, 0, 0)
-		if keyDown.w then moveVec += Vector3.new(0, 0, -1) end
-		if keyDown.s then moveVec += Vector3.new(0, 0, 1) end
-		if keyDown.a then moveVec += Vector3.new(-1, 0, 0) end
-		if keyDown.d then moveVec += Vector3.new(1, 0, 0) end
-		if keyDown.space then moveVec += Vector3.new(0, 1, 0) end
-		if keyDown.shift then moveVec += Vector3.new(0, -1, 0) end
-
-		local speed = 38
-		if moveVec.Magnitude > 0 then
-			moveVec = moveVec.Unit
-			local flat = Vector3.new(moveVec.X, 0, moveVec.Z)
-			local rot = CFrame.Angles(0, yaw, 0)
-			local worldFlat = rot:VectorToWorldSpace(flat)
-			local yMove = moveVec.Y
-			local finalMove = worldFlat + Vector3.new(0, yMove, 0)
-			astralPos += finalMove * speed * dt
-		end
-
-		local baseCf = CFrame.new(astralPos) * CFrame.Angles(0, yaw, 0)
-		local camOffset = CFrame.Angles(pitch, 0, 0) * CFrame.new(0, 2.5, 9)
-		local targetCamCf = baseCf * camOffset
-
-		camera.CFrame = camera.CFrame:Lerp(targetCamCf, math.clamp(dt * 10, 0, 1))
-		if originalFov then
-			camera.FieldOfView = originalFov
-		end
-
-		ghostRootPart.CFrame = baseCf
-		updateGhostCFrames(baseCf)
-	end)
-
-	charRemovingConn = player.CharacterRemoving:Connect(function()
-		stopAstral()
-	end)
+	end
 end
 
-userInputService.InputBegan:Connect(function(input, gpe)
-	if gpe then return end
-	if input.UserInputType == Enum.UserInputType.Keyboard then
-		if input.KeyCode == astralKey then
-			if astralActive then
-				stopAstral()
-			else
-				startAstral()
+-- redoLogic
+-- redo replays a previously undone action by re-invoking the server remotes with stored action data
+-- this is why each history record stores both template name and CFrame for placements/deletions
+local function performRedo()
+	if not history:CanRedo() then
+		print("Nothing to redo")
+		return
+	end
+
+	local action = history:Redo()
+	if action then
+		if action.type == "place" and action.data then
+			-- redo placement uses the stored templateName + CFrame so the result matches the original action
+			local remotes = ReplicatedStorage.BuildingSystem.RemoteEvents
+			local success, obj = remotes.PlaceObject:InvokeServer(action.data.name, action.data.cf)
+			if success and obj then
+				-- keeping the returned object reference ensures future undo can delete the correct instance
+				action.object = obj
+				print("Redid placement of", action.data.name)
 			end
-		elseif input.KeyCode == Enum.KeyCode.W then
-			keyDown.w = true
-		elseif input.KeyCode == Enum.KeyCode.A then
-			keyDown.a = true
-		elseif input.KeyCode == Enum.KeyCode.S then
-			keyDown.s = true
-		elseif input.KeyCode == Enum.KeyCode.D then
-			keyDown.d = true
-		elseif input.KeyCode == Enum.KeyCode.Space then
-			keyDown.space = true
-		elseif input.KeyCode == Enum.KeyCode.LeftShift then
-			keyDown.shift = true
+
+		elseif action.type == "delete" then
+			-- redo delete requires the object instance reference that was restored by undo
+			if action.object and action.object.Parent then
+				local remotes = ReplicatedStorage.BuildingSystem.RemoteEvents
+				local success = remotes.DeleteObject:InvokeServer(action.object)
+				if success then
+					action.object:Destroy()
+					print("Redid deletion of", action.data.name)
+				end
+			else
+				-- if the instance was removed or replaced, redo cannot safely identify the correct target
+				print("Object no longer exists")
+			end
+		end
+	end
+end
+
+-- placementEntryPoint
+-- startPlacingObject transitions the controller into place mode and delegates preview to PlacementModule
+-- this function also ensures delete mode is stopped so the two modes do not compete for mouse targeting
+local function startPlacingObject(objectName)
+	print("Attempting to place:", objectName)
+
+	-- verifying the template before entering placement mode prevents starting a preview that cannot be constructed
+	local template = mereology:FindFirstChild(objectName)
+	if not template then
+		warn("Template not found in Mereology:", objectName)
+		return false
+	end
+
+	-- stop deletion when entering placement to avoid overlapping highlighters / selection logic
+	if mode == "delete" then
+		deletion:Stop()
+	end
+
+	-- if a placement preview is already active, cancel it so only one ghost/preview exists at a time
+	if placing then
+		placement:Cancel()
+		placing = false
+	end
+
+	mode = "place"
+	ui:SetMode("place")
+
+	-- PlacementModule:Start typically spawns a ghost and begins updating it from mouse/raycast state
+	local success = placement:Start(objectName)
+	if success then
+		placing = true
+		-- info text is kept here (controller level) because it depends on mode and input bindings
+		ui:UpdateInfo("Q/E - Rotate | R - Axis [Yaw]\nLMB - Place | C - Cancel")
+		print("Successfully started placement for:", objectName)
+	else
+		print("Failed to start placement for:", objectName)
+	end
+
+	return success
+end
+
+-- inventoryBuild
+-- setupInventory rebuilds the scrolling list from Mereology templates and binds each entry to placement start
+-- it also builds a numeric hotkey index (1..9) so users can quickly select items without clicking
+local function setupInventory()
+	local container = ui.items
+
+	-- clearing old frames avoids duplicated buttons and duplicated event connections on rebuild
+	for _, child in ipairs(container:GetChildren()) do
+		if child:IsA("Frame") then
+			child:Destroy()
+		end
+	end
+
+	local itemIndex = {}
+	local index = 1
+
+	for _, obj in ipairs(mereology:GetChildren()) do
+		-- each template gets a frame containing a 3D viewport preview + label + transparent button overlay
+		local frame = Instance.new("Frame")
+		frame.Name = obj.Name
+		frame.BackgroundColor3 = Color3.fromRGB(35, 35, 40)
+		frame.BorderSizePixel = 0
+		frame.Parent = container
+
+		local corner = Instance.new("UICorner")
+		corner.CornerRadius = UDim.new(0, 8)
+		corner.Parent = frame
+
+		-- viewport preview is created from the template; this keeps inventory responsive without spawning into Workspace
+		Viewport.create(obj, frame)
+
+		local label = Instance.new("TextLabel")
+		label.Size = UDim2.new(1, -4, 0, 20)
+		label.Position = UDim2.new(0, 2, 1, -22)
+		label.BackgroundColor3 = Color3.fromRGB(25, 25, 30)
+		label.BorderSizePixel = 0
+		label.Text = obj.Name
+		label.TextColor3 = Color3.fromRGB(220, 220, 220)
+		label.TextSize = 11
+		label.Font = Enum.Font.Gotham
+		label.Parent = frame
+
+		local labelCorner = Instance.new("UICorner")
+		labelCorner.CornerRadius = UDim.new(0, 4)
+		labelCorner.Parent = label
+
+		-- only the first 9 items get number labels + hotkeys to keep the binding simple and predictable
+		if index <= 9 then
+			local numLabel = Instance.new("TextLabel")
+			numLabel.Size = UDim2.new(0, 20, 0, 20)
+			numLabel.Position = UDim2.new(0, 4, 0, 4)
+			numLabel.BackgroundColor3 = Color3.fromRGB(50, 50, 55)
+			numLabel.BorderSizePixel = 0
+			numLabel.Text = tostring(index)
+			numLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+			numLabel.TextSize = 12
+			numLabel.Font = Enum.Font.GothamBold
+			numLabel.ZIndex = 3
+			numLabel.Parent = frame
+
+			local numCorner = Instance.new("UICorner")
+			numCorner.CornerRadius = UDim.new(0, 4)
+			numCorner.Parent = numLabel
+
+			itemIndex[index] = obj.Name
+		end
+
+		-- full-frame button overlay means the user can click anywhere on the tile to select the item
+		local btn = Instance.new("TextButton")
+		btn.Size = UDim2.new(1, 0, 1, 0)
+		btn.BackgroundTransparency = 1
+		btn.Text = ""
+		btn.ZIndex = 2
+		btn.Parent = frame
+
+		-- hover tween is UI-only feedback; it does not affect placement logic or state
+		btn.MouseEnter:Connect(function()
+			TweenService:Create(frame, TweenInfo.new(0.15), {
+				BackgroundColor3 = Color3.fromRGB(45, 45, 50),
+			}):Play()
+		end)
+
+		btn.MouseLeave:Connect(function()
+			TweenService:Create(frame, TweenInfo.new(0.15), {
+				BackgroundColor3 = Color3.fromRGB(35, 35, 40),
+			}):Play()
+		end)
+
+		btn.MouseButton1Click:Connect(function()
+			-- inventory click begins placement, then optionally closes inventory so the user can see the world clearly
+			if startPlacingObject(obj.Name) then
+				if ui.state.inv then
+					ui:ToggleInv()
+				end
+			end
+		end)
+
+		index = index + 1
+	end
+
+	-- canvas size is recalculated from the grid layout so scrolling remains correct as items change
+	local layout = container:FindFirstChild("UIGridLayout")
+	if layout then
+		container.CanvasSize = UDim2.new(0, 0, 0, layout.AbsoluteContentSize.Y + 20)
+	end
+
+	return itemIndex
+end
+
+-- hotkeyIndex
+-- initialized empty; populated after setupInventory so numeric hotkeys can resolve to template names
+local itemIndex = {}
+
+-- uiGridBinding
+-- UI module emits a "grid enabled" signal; controller forwards that to GridModule
+ui:OnGrid(function(enabled)
+	grid:SetEnabled(enabled)
+end)
+
+-- uiModeBinding
+-- UI emits mode changes; controller ensures only one mode tool is running at a time
+-- this is the critical point that prevents both placement and deletion from owning input/preview simultaneously
+ui:OnMode(function(newMode)
+	if newMode ~= mode then
+		-- leaving a mode should clean up its state so it does not continue running hidden
+		if mode == "place" and placing then
+			placement:Cancel()
+			placing = false
+		elseif mode == "delete" then
+			deletion:Stop()
+		end
+
+		mode = newMode
+
+		if mode == "delete" then
+			-- deletion mode typically starts a targeting/highlight loop managed by DeletionModule
+			deletion:Start()
+			ui:UpdateInfo("LMB - Delete\nX - Exit\nZ/Y - Undo/Redo")
+		elseif mode == "none" then
+			-- none mode acts as a safe baseline: cancel any preview and remove any delete targeting visuals
+			if placing then
+				placement:Cancel()
+				placing = false
+			end
+			deletion:Stop()
 		end
 	end
 end)
 
-userInputService.InputEnded:Connect(function(input, gpe)
-	if input.UserInputType == Enum.UserInputType.Keyboard then
-		if input.KeyCode == Enum.KeyCode.W then
-			keyDown.w = false
-		elseif input.KeyCode == Enum.KeyCode.A then
-			keyDown.a = false
-		elseif input.KeyCode == Enum.KeyCode.S then
-			keyDown.s = false
-		elseif input.KeyCode == Enum.KeyCode.D then
-			keyDown.d = false
-		elseif input.KeyCode == Enum.KeyCode.Space then
-			keyDown.space = false
-		elseif input.KeyCode == Enum.KeyCode.LeftShift then
-			keyDown.shift = false
+-- keyboardAndMouseInputs
+-- controller centralizes user input mapping so modules stay focused on their respective behaviors
+UserInputService.InputBegan:Connect(function(input, processed)
+	if processed then return end
+
+	-- inventory toggle is global, regardless of mode, because it only affects UI
+	if input.KeyCode == Enum.KeyCode.B then
+		ui:ToggleInv()
+		return
+	end
+
+	-- grid toggle is global; it modifies snapping but does not switch placement/delete modes
+	if input.KeyCode == Enum.KeyCode.G then
+		ui:ToggleGrid()
+		return
+	end
+
+	-- delete mode toggle is global; it switches the tool that "owns" the mouse interaction
+	if input.KeyCode == Enum.KeyCode.V then
+		if mode == "delete" then
+			ui:SetMode("none")
+		else
+			ui:SetMode("delete")
+		end
+		return
+	end
+
+	-- undo/redo are blocked while placing so history cannot reference a preview that was never committed to server
+	if input.KeyCode == Enum.KeyCode.Z then
+		if not placing then
+			performUndo()
+		else
+			print("Can't undo while placing")
+		end
+		return
+	end
+
+	if input.KeyCode == Enum.KeyCode.Y then
+		if not placing then
+			performRedo()
+		else
+			print("Can't redo while placing")
+		end
+		return
+	end
+
+	-- numericHotkeys
+	-- numbers select items only when inventory is open, to avoid conflicting with other gameplay binds
+	local numberKeys = {
+		[Enum.KeyCode.One] = 1,
+		[Enum.KeyCode.Two] = 2,
+		[Enum.KeyCode.Three] = 3,
+		[Enum.KeyCode.Four] = 4,
+		[Enum.KeyCode.Five] = 5,
+		[Enum.KeyCode.Six] = 6,
+		[Enum.KeyCode.Seven] = 7,
+		[Enum.KeyCode.Eight] = 8,
+		[Enum.KeyCode.Nine] = 9,
+		[Enum.KeyCode.KeypadOne] = 1,
+		[Enum.KeyCode.KeypadTwo] = 2,
+		[Enum.KeyCode.KeypadThree] = 3,
+		[Enum.KeyCode.KeypadFour] = 4,
+		[Enum.KeyCode.KeypadFive] = 5,
+		[Enum.KeyCode.KeypadSix] = 6,
+		[Enum.KeyCode.KeypadSeven] = 7,
+		[Enum.KeyCode.KeypadEight] = 8,
+		[Enum.KeyCode.KeypadNine] = 9,
+	}
+
+	local num = numberKeys[input.KeyCode]
+	if num and itemIndex[num] and ui.state.inv then
+		-- if a hotkey selection succeeds, closing inventory improves visibility for placement
+		if startPlacingObject(itemIndex[num]) then
+			ui:ToggleInv()
+		end
+		return
+	end
+
+	-- modeSpecificInputs
+	if mode == "place" then
+		if placing then
+			-- rotation controls are delegated to PlacementModule; controller only chooses when to call them
+			if input.KeyCode == Enum.KeyCode.Q then
+				placement:Rotate(-1)
+			elseif input.KeyCode == Enum.KeyCode.E then
+				placement:Rotate(1)
+			elseif input.KeyCode == Enum.KeyCode.R then
+				-- axis switching updates UI so the player knows which axis future Q/E rotates around
+				local axis = placement:SwitchRotationAxis()
+				local axisName = axis == "Y" and "Yaw" or axis == "X" and "Pitch" or "Roll"
+				ui:UpdateInfo("Q/E - Rotate | R - Axis [" .. axisName .. "]\nLMB - Place | C - Cancel")
+			elseif input.UserInputType == Enum.UserInputType.MouseButton1 then
+				-- placement commit calls into PlacementModule, which should invoke server placement
+				-- history stores enough data to replay the action later (template name + CFrame)
+				local objName = placement.object
+				local success, obj = placement:Place()
+				if success and obj then
+					history:Add({
+						type = "place",
+						object = obj,
+						data = { name = objName, cf = obj.CFrame },
+					})
+					print("Placed and tracked:", objName)
+				end
+			elseif input.KeyCode == Enum.KeyCode.C then
+				-- cancel only stops preview; it does not change mode so the user can pick another item quickly
+				placement:Cancel()
+				placing = false
+				ui:UpdateInfo("Select item from inventory")
+			end
+		end
+
+		-- exit key is available even if not actively placing, because mode "place" may still be selected
+		if input.KeyCode == Enum.KeyCode.X then
+			if placing then
+				placement:Cancel()
+				placing = false
+			end
+			ui:SetMode("none")
+			mode = "none"
+		end
+
+	elseif mode == "delete" then
+		if input.UserInputType == Enum.UserInputType.MouseButton1 then
+			-- deletion target is owned by DeletionModule; controller reads it to build history data
+			local target = deletion.target
+			if target then
+				local targetName = target.Name
+				local targetCF = target.CFrame
+				local success = deletion:Delete()
+				if success then
+					history:Add({
+						type = "delete",
+						object = nil,
+						data = { name = targetName, cf = targetCF },
+					})
+					print("Deleted and tracked:", targetName)
+				end
+			end
+		elseif input.KeyCode == Enum.KeyCode.X then
+			-- exit delete mode stops targeting/highlight loop immediately to prevent lingering visuals
+			deletion:Stop()
+			ui:SetMode("none")
+			mode = "none"
 		end
 	end
 end)
 
-workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
-	camera = workspace.CurrentCamera
+-- touchPlacementAndDeletion
+-- touch input mirrors mouse input so mobile users can still place and delete without keyboard
+UserInputService.TouchTap:Connect(function(positions, processed)
+	if processed then return end
+
+	if mode == "place" and placing then
+		-- tap to place uses the same PlacementModule:Place call so server authority remains consistent across platforms
+		local objName = placement.object
+		local success, obj = placement:Place()
+		if success and obj then
+			history:Add({
+				type = "place",
+				object = obj,
+				data = { name = objName, cf = obj.CFrame },
+			})
+			print("Placed and tracked:", objName)
+		end
+	elseif mode == "delete" then
+		-- tap to delete relies on DeletionModule selecting a target based on touch position / current target logic
+		local target = deletion.target
+		if target then
+			local targetName = target.Name
+			local targetCF = target.CFrame
+			local success = deletion:Delete()
+			if success then
+				history:Add({
+					type = "delete",
+					object = nil,
+					data = { name = targetName, cf = targetCF },
+				})
+				print("Deleted and tracked:", targetName)
+			end
+		end
+	end
 end)
+
+-- touchRotation
+-- long press maps to rotate so mobile users can still adjust orientation without extra UI buttons
+UserInputService.TouchLongPress:Connect(function(positions, state, processed)
+	if processed or mode ~= "place" or not placing then return end
+
+	if state == Enum.UserInputState.Begin then
+		placement:Rotate(1)
+	end
+end)
+
+-- startupInventoryBuild
+-- small delay gives UI time to finish loading and ensures mereology children are replicated before building tiles
+task.wait(0.1)
+itemIndex = setupInventory()
