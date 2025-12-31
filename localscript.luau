@@ -1,400 +1,511 @@
---// services (cached once so we don't keep calling GetService)
 local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
-local Workspace = game:GetService("Workspace")
 
---// modules
--- Config = keybinds + per-view labels/hints
--- Utils = tweens/helpers + disconnect safety
--- Effects = postfx + fov pulse
--- CameraRig = builds the viewport "world" + keeps it in sync
-local Config = require(script.Parent.Config)
-local Utils = require(script.Parent.Utils)
-local Effects = require(script.Parent.Effects)
-local CameraRig = require(script.Parent.CameraRig)
-
-local Controller = {}
-
+-- playerRefs
 local player = Players.LocalPlayer
-local playerGui = player:WaitForChild("PlayerGui")
+local gui = player:WaitForChild("PlayerGui"):WaitForChild("BuildingUI")
+local mouse = player:GetMouse()
 
--- core state
--- enabled is the big kill-switch (render loop + input logic checks it)
--- sessionId is basically my "cancel token" for task.spawn loops so they don't keep running after disable
--- focusedView tells me which rig is currently living in the fullscreen viewport
-local enabled = false
-local character = nil
-local rootPart = nil
-local rigs = {}
-local renderConn = nil
-local sessionId = 0
-local focusedView = nil
+-- storageRefs
+-- BuildingSystem contains modules and remotes; Mereology is the template library used for inventory + placement
+local system = ReplicatedStorage:WaitForChild("BuildingSystem")
+local modules = system:WaitForChild("Modules")
+local mereology = ReplicatedStorage:WaitForChild("Mereology")
 
--- ui refs (filled in init; I don't wanna be doing WaitForChild/FindFirstChild in RenderStepped)
-local screenGui
-local holder
-local header
-local vpContainer
-local fullOverlay
-local viewports = {}
-local fullViewport
-local fullCamLabel
-local fullHint
+-- moduleImports
+-- this script intentionally does not implement placement/deletion logic; it delegates behavior to focused modules
+local Placement = require(modules:WaitForChild("PlacementModule"))
+local Deletion = require(modules:WaitForChild("DeletionModule"))
+local UI = require(modules:WaitForChild("UIModule"))
+local Viewport = require(modules:WaitForChild("ViewportHandler"))
+local Grid = require(modules:WaitForChild("GridModule"))
+local History = require(modules:WaitForChild("HistoryModule"))
 
--- fadeIn resets transparency first
--- this matters because you can toggle on while the old fadeOut is mid-tween (otherwise it looks half-broken)
-local function fadeIn()
-	local ti = TweenInfo.new(0.28, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+-- moduleInstances
+-- these are stateful objects that manage their own connections/preview state internally
+local placement = Placement.new(player, mouse)
+local deletion = Deletion.new(player, mouse)
+local ui = UI.new(gui)
+local grid = Grid.new(2)
+local history = History.new()
 
-	holder.BackgroundTransparency = 1
-	for _, child in holder:GetDescendants() do
-		if child:IsA("TextLabel") then
-			child.TextTransparency = 1
-		elseif child:IsA("Frame") and child.Name ~= "Header" and child.Name ~= "ViewportContainer" then
-			-- leave layout containers alone; only fade the real visible frames (dots, pills, etc)
-			child.BackgroundTransparency = 1
-		end
-	end
+-- gridWiring
+-- placement uses grid snapping; the grid module is passed in so snapping rules can be toggled without changing placement code
+placement:SetGrid(grid)
 
-	Utils.tween(holder, ti, { BackgroundTransparency = 0.04 })
+-- controllerState
+-- mode is the controller truth; placing is a tighter flag used to know if placement preview is actively running
+local mode = "none"
+local placing = false
+local placedObjects = {} -- kept for compatibility; history is the actual undo/redo source in this controller
 
-	-- viewport tiles are their own frames, so fade those too
-	for _, vp in vpContainer:GetChildren() do
-		if vp:IsA("Frame") then
-			vp.BackgroundTransparency = 1
-			Utils.tween(vp, ti, { BackgroundTransparency = 0 })
-		end
-	end
-
-	-- header has a mix of labels + frames
-	for _, child in header:GetDescendants() do
-		if child:IsA("TextLabel") then
-			Utils.tween(child, ti, { TextTransparency = 0 })
-		elseif child:IsA("Frame") then
-			Utils.tween(child, ti, { BackgroundTransparency = 0 })
-		end
-	end
-end
-
--- fadeOut doesn't reset anything; I want it to fade from whatever state it's currently at
--- the real "turn off" happens later in disable() after the tween finishes
-local function fadeOut()
-	local ti = TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
-
-	Utils.tween(holder, ti, { BackgroundTransparency = 1 })
-
-	for _, vp in vpContainer:GetChildren() do
-		if vp:IsA("Frame") then
-			Utils.tween(vp, ti, { BackgroundTransparency = 1 })
-		end
-	end
-
-	for _, child in header:GetDescendants() do
-		if child:IsA("TextLabel") then
-			Utils.tween(child, ti, { TextTransparency = 1 })
-		elseif child:IsA("Frame") then
-			Utils.tween(child, ti, { BackgroundTransparency = 1 })
-		end
-	end
-end
-
--- pull fresh character refs
--- I keep rootPart cached because everything (rig follow / offsets) is based on that
-local function refreshCharacter()
-	character = player.Character
-	if not character then
-		rootPart = nil
+-- undoLogic
+-- undo reads the last action from history and reverses it by calling the same server remotes used for normal actions
+-- this means undo stays compatible with server validation rules and avoids client-only deletes/creates
+local function performUndo()
+	if not history:CanUndo() then
+		-- early exit avoids calling Undo() when the stack is empty, which keeps HistoryModule simpler
+		print("Nothing to undo")
 		return
 	end
 
-	local hrp = character:FindFirstChild("HumanoidRootPart")
-	-- HRP is the normal case; PrimaryPart is the backup for weird rigs
-	rootPart = if hrp and hrp:IsA("BasePart") then hrp else character.PrimaryPart
-end
-
--- clean rigs properly (each rig owns a WorldModel + camera setup)
-local function destroyRigs()
-	for _, rig in rigs do
-		CameraRig.destroy(rig)
-	end
-	table.clear(rigs)
-end
-
--- rebuild all rigs (used on enable + respawn)
--- destroy first so I never end up with duplicate WorldModels sitting in viewports
-local function buildRigs()
-	destroyRigs()
-	refreshCharacter()
-
-	-- if you're between spawns, just don't build yet
-	if not character or not rootPart then return end
-
-	-- one rig per viewport (rear/side/top)
-	for viewKey, viewport in viewports do
-		local rig = CameraRig.create(viewKey, character, rootPart, viewport)
-		if rig then
-			table.insert(rigs, rig)
-		end
-	end
-end
-
--- rigs is tiny (3), so linear search is totally fine and keeps the rest simple
-local function findRig(viewKey)
-	for _, rig in rigs do
-		if rig.viewKey == viewKey then return rig end
-	end
-	return nil
-end
-
--- RenderStepped update
--- main idea: rigs mirror the real character pose into clones, then update their cameras smoothly
-local function onRender(dt)
-	-- cheap guards first (RenderStepped is hot)
-	if not enabled or #rigs == 0 then return end
-	if not character or not character.Parent then return end
-	if not rootPart or not rootPart.Parent then return end
-
-	local t = os.clock()
-
-	for _, rig in rigs do
-		-- copy live character pose into the rig's clone world
-		CameraRig.syncPose(rig)
-
-		-- update the rig camera (lerp + wobble uses time)
-		CameraRig.updateCamera(rig, dt, t)
-	end
-end
-
--- fullscreen works by moving the *same* WorldModel between viewports
--- no rebuild = no GC spikes + you keep camera smoothing state
-local function exitFullscreen()
-	if not focusedView then return end
-
-	local rig = findRig(focusedView)
-	local smallVp = viewports[focusedView]
-
-	-- put the world back + make sure the small viewport points at the right camera again
-	if rig and smallVp then
-		rig.world.Parent = smallVp
-		smallVp.CurrentCamera = rig.camera
-	end
-
-	-- fade overlay out, then hide it
-	Utils.tween(fullOverlay, TweenInfo.new(0.18, Enum.EasingStyle.Quad), { BackgroundTransparency = 1 })
-	task.delay(0.2, function()
-		fullOverlay.Visible = false
-	end)
-
-	focusedView = nil
-end
-
--- enter fullscreen for a view key
--- pressing the same key again = toggle off
--- switching views = exit first so the world isn't "owned" by two viewports at once
-local function enterFullscreen(viewKey)
-	if focusedView == viewKey then
-		exitFullscreen()
-		return
-	end
-
-	if focusedView then
-		exitFullscreen()
-		task.wait(0.1)
-	end
-
-	local rig = findRig(viewKey)
-	if not rig then return end
-
-	local cfg = Config.views[viewKey]
-
-	-- keep UI text driven by config so bind + label never drift
-	fullCamLabel.Text = cfg.label
-	fullHint.Text = "PRESS " .. cfg.hint .. " TO EXIT"
-
-	-- the actual swap: reparent world into fullscreen viewport and point it at the rig camera
-	rig.world.Parent = fullViewport
-	fullViewport.CurrentCamera = rig.camera
-
-	fullOverlay.BackgroundTransparency = 1
-	fullOverlay.Visible = true
-	Utils.tween(fullOverlay, TweenInfo.new(0.22, Enum.EasingStyle.Quad), { BackgroundTransparency = 0.2 })
-
-	focusedView = viewKey
-end
-
--- UI loops (clock + rec blink)
--- sessionId check is what stops these from lingering after disable without having to store extra flags
-local function startUiLoops(mySession)
-	local startTime = os.clock()
-	local clock = header:FindFirstChild("Clock")
-	local recDot = header:FindFirstChild("RecHolder") and header.RecHolder:FindFirstChild("RecDot")
-
-	-- elapsed timer (uses os.clock so it won't jump around)
-	task.spawn(function()
-		while enabled and sessionId == mySession do
-			if clock then
-				local elapsed = math.max(0, math.floor(os.clock() - startTime))
-				clock.Text = Utils.formatTime(elapsed)
-			end
-			task.wait(0.25)
-		end
-	end)
-
-	-- blinking REC dot (slightly uneven timing feels nicer than perfect 50/50)
-	task.spawn(function()
-		while enabled and sessionId == mySession do
-			if recDot then
-				recDot.BackgroundTransparency = 0
-				task.wait(0.55)
-				recDot.BackgroundTransparency = 0.5
-				task.wait(0.45)
+	local action = history:Undo()
+	if action then
+		if action.type == "place" then
+			-- undoing a placement is equivalent to deleting that placed instance
+			-- we only attempt the delete if the object reference still exists and is parented
+			if action.object and action.object.Parent then
+				-- remotes are fetched at call-time to reduce coupling if the folder is reloaded or replaced during play
+				local remotes = ReplicatedStorage.BuildingSystem.RemoteEvents
+				local success = remotes.DeleteObject:InvokeServer(action.object)
+				if success then
+					-- destroying locally removes the instance immediately for the player; server should have already removed it too
+					action.object:Destroy()
+					print("Undid placement of", action.data.name)
+				end
 			else
-				task.wait(0.5)
+				-- object references can become invalid if the server already deleted it or it was cleaned up externally
+				print("Object no longer exists")
+			end
+
+		elseif action.type == "delete" and action.data then
+			-- undoing a deletion is equivalent to re-placing the same template at the previous CFrame
+			local remotes = ReplicatedStorage.BuildingSystem.RemoteEvents
+			local success, obj = remotes.PlaceObject:InvokeServer(action.data.name, action.data.cf)
+			if success then
+				-- updating the action object reference makes redo work later (redo needs a live instance to delete again)
+				print("Undid deletion of", action.data.name)
+				action.object = obj
 			end
 		end
-	end)
+	end
 end
 
--- enable order matters:
--- show UI first (instant feedback) -> postfx -> build rigs -> connect render loop -> start UI loops
-local function enable()
-	if enabled then return end
-
-	refreshCharacter()
-	if not character or not rootPart then
-		warn("[CCTV] No character")
+-- redoLogic
+-- redo replays a previously undone action by re-invoking the server remotes with stored action data
+-- this is why each history record stores both template name and CFrame for placements/deletions
+local function performRedo()
+	if not history:CanRedo() then
+		print("Nothing to redo")
 		return
 	end
 
-	enabled = true
-	sessionId += 1
-	local mySession = sessionId
+	local action = history:Redo()
+	if action then
+		if action.type == "place" and action.data then
+			-- redo placement uses the stored templateName + CFrame so the result matches the original action
+			local remotes = ReplicatedStorage.BuildingSystem.RemoteEvents
+			local success, obj = remotes.PlaceObject:InvokeServer(action.data.name, action.data.cf)
+			if success and obj then
+				-- keeping the returned object reference ensures future undo can delete the correct instance
+				action.object = obj
+				print("Redid placement of", action.data.name)
+			end
 
-	screenGui.Enabled = true
-	fadeIn()
-
-	Effects.enableCC()
-	Effects.pulseCamera()
-
-	buildRigs()
-
-	-- disconnect first so double-enables don't stack RenderStepped connections
-	Utils.disconnect(renderConn)
-	renderConn = RunService.RenderStepped:Connect(onRender)
-
-	startUiLoops(mySession)
-end
-
--- disable is basically the reverse:
--- stop per-frame work immediately -> exit fullscreen while rigs still exist -> fade -> cleanup after fade
-local function disable()
-	if not enabled then return end
-
-	enabled = false
-	sessionId += 1
-
-	Utils.disconnect(renderConn)
-	renderConn = nil
-
-	exitFullscreen()
-
-	Effects.resetCamera()
-	fadeOut()
-
-	-- let the fade finish before nuking rigs/UI
-	task.delay(0.22, function()
-		destroyRigs()
-		screenGui.Enabled = false
-	end)
-
-	Effects.disableCC()
-end
-
-local function toggle()
-	if enabled then disable() else enable() end
-end
-
--- respawn hook
--- if the system is on, rebuild rigs so the clone worlds match the new character model
-local function onCharacterAdded(char)
-	character = char
-	local hrp = char:FindFirstChild("HumanoidRootPart")
-	rootPart = if hrp and hrp:IsA("BasePart") then hrp else char.PrimaryPart
-
-	if enabled then
-		buildRigs()
+		elseif action.type == "delete" then
+			-- redo delete requires the object instance reference that was restored by undo
+			if action.object and action.object.Parent then
+				local remotes = ReplicatedStorage.BuildingSystem.RemoteEvents
+				local success = remotes.DeleteObject:InvokeServer(action.object)
+				if success then
+					action.object:Destroy()
+					print("Redid deletion of", action.data.name)
+				end
+			else
+				-- if the instance was removed or replaced, redo cannot safely identify the correct target
+				print("Object no longer exists")
+			end
+		end
 	end
 end
 
--- character is about to be destroyed, so drop refs and clean rigs before they point at dead instances
-local function onCharacterRemoving()
-	character = nil
-	rootPart = nil
-	exitFullscreen()
-	destroyRigs()
+-- placementEntryPoint
+-- startPlacingObject transitions the controller into place mode and delegates preview to PlacementModule
+-- this function also ensures delete mode is stopped so the two modes do not compete for mouse targeting
+local function startPlacingObject(objectName)
+	print("Attempting to place:", objectName)
+
+	-- verifying the template before entering placement mode prevents starting a preview that cannot be constructed
+	local template = mereology:FindFirstChild(objectName)
+	if not template then
+		warn("Template not found in Mereology:", objectName)
+		return false
+	end
+
+	-- stop deletion when entering placement to avoid overlapping highlighters / selection logic
+	if mode == "delete" then
+		deletion:Stop()
+	end
+
+	-- if a placement preview is already active, cancel it so only one ghost/preview exists at a time
+	if placing then
+		placement:Cancel()
+		placing = false
+	end
+
+	mode = "place"
+	ui:SetMode("place")
+
+	-- PlacementModule:Start typically spawns a ghost and begins updating it from mouse/raycast state
+	local success = placement:Start(objectName)
+	if success then
+		placing = true
+		-- info text is kept here (controller level) because it depends on mode and input bindings
+		ui:UpdateInfo("Q/E - Rotate | R - Axis [Yaw]\nLMB - Place | C - Cancel")
+		print("Successfully started placement for:", objectName)
+	else
+		print("Failed to start placement for:", objectName)
+	end
+
+	return success
 end
 
--- init runs once from the LocalScript
--- grabs UI refs, wires input, and hooks character/camera changes
-function Controller.init()
-	-- timeout so I don't yield forever if the UI isn't in PlayerGui
-	screenGui = playerGui:WaitForChild("CCTVInterface", 10)
-	if not screenGui then
-		warn("[CCTV] UI not found")
+-- inventoryBuild
+-- setupInventory rebuilds the scrolling list from Mereology templates and binds each entry to placement start
+-- it also builds a numeric hotkey index (1..9) so users can quickly select items without clicking
+local function setupInventory()
+	local container = ui.items
+
+	-- clearing old frames avoids duplicated buttons and duplicated event connections on rebuild
+	for _, child in ipairs(container:GetChildren()) do
+		if child:IsA("Frame") then
+			child:Destroy()
+		end
+	end
+
+	local itemIndex = {}
+	local index = 1
+
+	for _, obj in ipairs(mereology:GetChildren()) do
+		-- each template gets a frame containing a 3D viewport preview + label + transparent button overlay
+		local frame = Instance.new("Frame")
+		frame.Name = obj.Name
+		frame.BackgroundColor3 = Color3.fromRGB(35, 35, 40)
+		frame.BorderSizePixel = 0
+		frame.Parent = container
+
+		local corner = Instance.new("UICorner")
+		corner.CornerRadius = UDim.new(0, 8)
+		corner.Parent = frame
+
+		-- viewport preview is created from the template; this keeps inventory responsive without spawning into Workspace
+		Viewport.create(obj, frame)
+
+		local label = Instance.new("TextLabel")
+		label.Size = UDim2.new(1, -4, 0, 20)
+		label.Position = UDim2.new(0, 2, 1, -22)
+		label.BackgroundColor3 = Color3.fromRGB(25, 25, 30)
+		label.BorderSizePixel = 0
+		label.Text = obj.Name
+		label.TextColor3 = Color3.fromRGB(220, 220, 220)
+		label.TextSize = 11
+		label.Font = Enum.Font.Gotham
+		label.Parent = frame
+
+		local labelCorner = Instance.new("UICorner")
+		labelCorner.CornerRadius = UDim.new(0, 4)
+		labelCorner.Parent = label
+
+		-- only the first 9 items get number labels + hotkeys to keep the binding simple and predictable
+		if index <= 9 then
+			local numLabel = Instance.new("TextLabel")
+			numLabel.Size = UDim2.new(0, 20, 0, 20)
+			numLabel.Position = UDim2.new(0, 4, 0, 4)
+			numLabel.BackgroundColor3 = Color3.fromRGB(50, 50, 55)
+			numLabel.BorderSizePixel = 0
+			numLabel.Text = tostring(index)
+			numLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+			numLabel.TextSize = 12
+			numLabel.Font = Enum.Font.GothamBold
+			numLabel.ZIndex = 3
+			numLabel.Parent = frame
+
+			local numCorner = Instance.new("UICorner")
+			numCorner.CornerRadius = UDim.new(0, 4)
+			numCorner.Parent = numLabel
+
+			itemIndex[index] = obj.Name
+		end
+
+		-- full-frame button overlay means the user can click anywhere on the tile to select the item
+		local btn = Instance.new("TextButton")
+		btn.Size = UDim2.new(1, 0, 1, 0)
+		btn.BackgroundTransparency = 1
+		btn.Text = ""
+		btn.ZIndex = 2
+		btn.Parent = frame
+
+		-- hover tween is UI-only feedback; it does not affect placement logic or state
+		btn.MouseEnter:Connect(function()
+			TweenService:Create(frame, TweenInfo.new(0.15), {
+				BackgroundColor3 = Color3.fromRGB(45, 45, 50),
+			}):Play()
+		end)
+
+		btn.MouseLeave:Connect(function()
+			TweenService:Create(frame, TweenInfo.new(0.15), {
+				BackgroundColor3 = Color3.fromRGB(35, 35, 40),
+			}):Play()
+		end)
+
+		btn.MouseButton1Click:Connect(function()
+			-- inventory click begins placement, then optionally closes inventory so the user can see the world clearly
+			if startPlacingObject(obj.Name) then
+				if ui.state.inv then
+					ui:ToggleInv()
+				end
+			end
+		end)
+
+		index = index + 1
+	end
+
+	-- canvas size is recalculated from the grid layout so scrolling remains correct as items change
+	local layout = container:FindFirstChild("UIGridLayout")
+	if layout then
+		container.CanvasSize = UDim2.new(0, 0, 0, layout.AbsoluteContentSize.Y + 20)
+	end
+
+	return itemIndex
+end
+
+-- hotkeyIndex
+-- initialized empty; populated after setupInventory so numeric hotkeys can resolve to template names
+local itemIndex = {}
+
+-- uiGridBinding
+-- UI module emits a "grid enabled" signal; controller forwards that to GridModule
+ui:OnGrid(function(enabled)
+	grid:SetEnabled(enabled)
+end)
+
+-- uiModeBinding
+-- UI emits mode changes; controller ensures only one mode tool is running at a time
+-- this is the critical point that prevents both placement and deletion from owning input/preview simultaneously
+ui:OnMode(function(newMode)
+	if newMode ~= mode then
+		-- leaving a mode should clean up its state so it does not continue running hidden
+		if mode == "place" and placing then
+			placement:Cancel()
+			placing = false
+		elseif mode == "delete" then
+			deletion:Stop()
+		end
+
+		mode = newMode
+
+		if mode == "delete" then
+			-- deletion mode typically starts a targeting/highlight loop managed by DeletionModule
+			deletion:Start()
+			ui:UpdateInfo("LMB - Delete\nX - Exit\nZ/Y - Undo/Redo")
+		elseif mode == "none" then
+			-- none mode acts as a safe baseline: cancel any preview and remove any delete targeting visuals
+			if placing then
+				placement:Cancel()
+				placing = false
+			end
+			deletion:Stop()
+		end
+	end
+end)
+
+-- keyboardAndMouseInputs
+-- controller centralizes user input mapping so modules stay focused on their respective behaviors
+UserInputService.InputBegan:Connect(function(input, processed)
+	if processed then return end
+
+	-- inventory toggle is global, regardless of mode, because it only affects UI
+	if input.KeyCode == Enum.KeyCode.B then
+		ui:ToggleInv()
 		return
 	end
 
-	holder = screenGui:WaitForChild("Holder")
-	header = holder:WaitForChild("Header")
-	vpContainer = holder:WaitForChild("ViewportContainer")
-	fullOverlay = screenGui:WaitForChild("FullscreenOverlay")
+	-- grid toggle is global; it modifies snapping but does not switch placement/delete modes
+	if input.KeyCode == Enum.KeyCode.G then
+		ui:ToggleGrid()
+		return
+	end
 
-	-- cache viewport frames once; CameraRig just needs a parent, not the whole UI path
-	viewports = {
-		rear = vpContainer:WaitForChild("VP_rear"):WaitForChild("Viewport"),
-		side = vpContainer:WaitForChild("VP_side"):WaitForChild("Viewport"),
-		top = vpContainer:WaitForChild("VP_top"):WaitForChild("Viewport"),
+	-- delete mode toggle is global; it switches the tool that "owns" the mouse interaction
+	if input.KeyCode == Enum.KeyCode.V then
+		if mode == "delete" then
+			ui:SetMode("none")
+		else
+			ui:SetMode("delete")
+		end
+		return
+	end
+
+	-- undo/redo are blocked while placing so history cannot reference a preview that was never committed to server
+	if input.KeyCode == Enum.KeyCode.Z then
+		if not placing then
+			performUndo()
+		else
+			print("Can't undo while placing")
+		end
+		return
+	end
+
+	if input.KeyCode == Enum.KeyCode.Y then
+		if not placing then
+			performRedo()
+		else
+			print("Can't redo while placing")
+		end
+		return
+	end
+
+	-- numericHotkeys
+	-- numbers select items only when inventory is open, to avoid conflicting with other gameplay binds
+	local numberKeys = {
+		[Enum.KeyCode.One] = 1,
+		[Enum.KeyCode.Two] = 2,
+		[Enum.KeyCode.Three] = 3,
+		[Enum.KeyCode.Four] = 4,
+		[Enum.KeyCode.Five] = 5,
+		[Enum.KeyCode.Six] = 6,
+		[Enum.KeyCode.Seven] = 7,
+		[Enum.KeyCode.Eight] = 8,
+		[Enum.KeyCode.Nine] = 9,
+		[Enum.KeyCode.KeypadOne] = 1,
+		[Enum.KeyCode.KeypadTwo] = 2,
+		[Enum.KeyCode.KeypadThree] = 3,
+		[Enum.KeyCode.KeypadFour] = 4,
+		[Enum.KeyCode.KeypadFive] = 5,
+		[Enum.KeyCode.KeypadSix] = 6,
+		[Enum.KeyCode.KeypadSeven] = 7,
+		[Enum.KeyCode.KeypadEight] = 8,
+		[Enum.KeyCode.KeypadNine] = 9,
 	}
 
-	fullViewport = fullOverlay:WaitForChild("FullViewportFrame"):WaitForChild("Viewport")
-	fullCamLabel = fullOverlay:WaitForChild("CamLabel")
-	fullHint = fullOverlay:WaitForChild("ExitHint")
-
-	-- input:
-	-- gpe check stops toggling while typing in a textbox etc
-	-- toggle key works always; view keys only do something when enabled
-	UserInputService.InputBegan:Connect(function(input, gpe)
-		if gpe then return end
-		if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
-
-		if input.KeyCode == Config.toggleKey then
-			toggle()
-			return
+	local num = numberKeys[input.KeyCode]
+	if num and itemIndex[num] and ui.state.inv then
+		-- if a hotkey selection succeeds, closing inventory improves visibility for placement
+		if startPlacingObject(itemIndex[num]) then
+			ui:ToggleInv()
 		end
+		return
+	end
 
-		if not enabled then return end
-
-		for viewKey, keyCode in Config.viewKeys do
-			if input.KeyCode == keyCode then
-				enterFullscreen(viewKey)
-				return
+	-- modeSpecificInputs
+	if mode == "place" then
+		if placing then
+			-- rotation controls are delegated to PlacementModule; controller only chooses when to call them
+			if input.KeyCode == Enum.KeyCode.Q then
+				placement:Rotate(-1)
+			elseif input.KeyCode == Enum.KeyCode.E then
+				placement:Rotate(1)
+			elseif input.KeyCode == Enum.KeyCode.R then
+				-- axis switching updates UI so the player knows which axis future Q/E rotates around
+				local axis = placement:SwitchRotationAxis()
+				local axisName = axis == "Y" and "Yaw" or axis == "X" and "Pitch" or "Roll"
+				ui:UpdateInfo("Q/E - Rotate | R - Axis [" .. axisName .. "]\nLMB - Place | C - Cancel")
+			elseif input.UserInputType == Enum.UserInputType.MouseButton1 then
+				-- placement commit calls into PlacementModule, which should invoke server placement
+				-- history stores enough data to replay the action later (template name + CFrame)
+				local objName = placement.object
+				local success, obj = placement:Place()
+				if success and obj then
+					history:Add({
+						type = "place",
+						object = obj,
+						data = { name = objName, cf = obj.CFrame },
+					})
+					print("Placed and tracked:", objName)
+				end
+			elseif input.KeyCode == Enum.KeyCode.C then
+				-- cancel only stops preview; it does not change mode so the user can pick another item quickly
+				placement:Cancel()
+				placing = false
+				ui:UpdateInfo("Select item from inventory")
 			end
 		end
-	end)
 
-	-- if something swaps Workspace.CurrentCamera (cutscenes), Effects needs to recache baseline fov
-	Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
-		Effects.updateStoredFov()
-	end)
+		-- exit key is available even if not actively placing, because mode "place" may still be selected
+		if input.KeyCode == Enum.KeyCode.X then
+			if placing then
+				placement:Cancel()
+				placing = false
+			end
+			ui:SetMode("none")
+			mode = "none"
+		end
 
-	-- late join: if the character already exists, run the same setup path
-	if player.Character then
-		onCharacterAdded(player.Character)
+	elseif mode == "delete" then
+		if input.UserInputType == Enum.UserInputType.MouseButton1 then
+			-- deletion target is owned by DeletionModule; controller reads it to build history data
+			local target = deletion.target
+			if target then
+				local targetName = target.Name
+				local targetCF = target.CFrame
+				local success = deletion:Delete()
+				if success then
+					history:Add({
+						type = "delete",
+						object = nil,
+						data = { name = targetName, cf = targetCF },
+					})
+					print("Deleted and tracked:", targetName)
+				end
+			end
+		elseif input.KeyCode == Enum.KeyCode.X then
+			-- exit delete mode stops targeting/highlight loop immediately to prevent lingering visuals
+			deletion:Stop()
+			ui:SetMode("none")
+			mode = "none"
+		end
 	end
-	player.CharacterAdded:Connect(onCharacterAdded)
-	player.CharacterRemoving:Connect(onCharacterRemoving)
-end
+end)
 
-return Controller
+-- touchPlacementAndDeletion
+-- touch input mirrors mouse input so mobile users can still place and delete without keyboard
+UserInputService.TouchTap:Connect(function(positions, processed)
+	if processed then return end
+
+	if mode == "place" and placing then
+		-- tap to place uses the same PlacementModule:Place call so server authority remains consistent across platforms
+		local objName = placement.object
+		local success, obj = placement:Place()
+		if success and obj then
+			history:Add({
+				type = "place",
+				object = obj,
+				data = { name = objName, cf = obj.CFrame },
+			})
+			print("Placed and tracked:", objName)
+		end
+	elseif mode == "delete" then
+		-- tap to delete relies on DeletionModule selecting a target based on touch position / current target logic
+		local target = deletion.target
+		if target then
+			local targetName = target.Name
+			local targetCF = target.CFrame
+			local success = deletion:Delete()
+			if success then
+				history:Add({
+					type = "delete",
+					object = nil,
+					data = { name = targetName, cf = targetCF },
+				})
+				print("Deleted and tracked:", targetName)
+			end
+		end
+	end
+end)
+
+-- touchRotation
+-- long press maps to rotate so mobile users can still adjust orientation without extra UI buttons
+UserInputService.TouchLongPress:Connect(function(positions, state, processed)
+	if processed or mode ~= "place" or not placing then return end
+
+	if state == Enum.UserInputState.Begin then
+		placement:Rotate(1)
+	end
+end)
+
+-- startupInventoryBuild
+-- small delay gives UI time to finish loading and ensures mereology children are replicated before building tiles
+task.wait(0.1)
+itemIndex = setupInventory()
